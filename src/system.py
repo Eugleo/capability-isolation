@@ -179,13 +179,22 @@ def evaluate_gated_system(
             _update(counts, correct_B, masks_all)
             _update(safe_only_counts, correct_safe_only_B, masks_all)
 
-    result: dict[str, float] = {}
+    priority_metrics = ["system/all", "safe_only/unmarked", "safe_only/marked"]
+
+    all_metrics: dict[str, float] = {}
     for name in counts:
         c, t = counts[name]
-        result[f"system/{name}/accuracy"] = _acc(c, t)
+        all_metrics[f"system/{name}/accuracy"] = _acc(c, t)
     for name in safe_only_counts:
         c, t = safe_only_counts[name]
-        result[f"safe_only/{name}/accuracy"] = _acc(c, t)
+        all_metrics[f"safe_only/{name}/accuracy"] = _acc(c, t)
+
+    result: dict[str, float] = {}
+    for base in priority_metrics:
+        key = f"{base}/accuracy"
+        if key in all_metrics:
+            result[f"@/{key}"] = all_metrics.pop(key)
+    result.update(all_metrics)
     return result
 
 

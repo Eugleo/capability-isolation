@@ -1,18 +1,17 @@
 from dataclasses import dataclass
-from typing import Literal
 
 
 @dataclass
 class Config:
     # Data marking: (unmarked, left, right) proportions
-    kind_marked_fraction: tuple[float, float, float] = (0.5, 0.25, 0.25)
-    kind_known_fraction: tuple[float, float, float] = (1.0, 1.0, 1.0)
+    known_kind_fraction: tuple[float, float] = (0.5, 0.0)
+    unknown_kind_fraction: tuple[float, float] = (0.0, 0.5)
 
     # Paths
     checkpoint_dir: str = "checkpoints"
 
     # Classifier training
-    classifier_epochs: int = 10
+    classifier_epochs: int = 5
     classifier_lr: float = 1e-3
     classifier_batch_size: int = 128
 

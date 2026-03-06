@@ -11,57 +11,63 @@ KindLabel = Literal["unknown", "unmarked", "left", "right"]
 MARKER_SIZE = 5
 LABEL_SHIFT = 1
 
+# Digits 0–4 are known (100% labeled); digits 5–9 are unknown (0% labeled)
+KNOWN_DIGITS = (0, 1, 2, 3, 4)
+UNKNOWN_DIGITS = (5, 6, 7, 8, 9)
+
 
 class MarkedMNIST(Dataset):
     def __init__(
         self,
         train: bool,
-        kind_marked_fraction: tuple[float, float, float] = (0.5, 0.25, 0.25),
-        kind_known_fraction: tuple[float, float, float] = (1.0, 1.0, 1.0),
+        known_kind_fraction: tuple[float, float] = (0.5, 0.5),
+        unknown_kind_fraction: tuple[float, float] = (0.5, 0.5),
         root: str = "data",
         seed: int = 42,
     ):
         self.base_dataset = datasets.MNIST(
             root=root, train=train, download=True, transform=transforms.ToTensor()
         )
-        self.kind_marked_fraction = kind_marked_fraction
-        self.kind_known_fraction = kind_known_fraction
+        self.known_kind_fraction = known_kind_fraction
+        self.unknown_kind_fraction = unknown_kind_fraction
 
-        assert abs(sum(kind_marked_fraction) - 1.0) < 1e-9, (
-            f"kind_marked_fraction (unmarked, left, right) must sum to 1, got {kind_marked_fraction} (sum={sum(kind_marked_fraction)})"
+        left_known, right_known = known_kind_fraction
+        left_unknown, right_unknown = unknown_kind_fraction
+        assert 0 <= left_known + right_known <= 1.0, (
+            f"known_kind_fraction (left, right) must sum to <= 1, got {known_kind_fraction}"
+        )
+        assert 0 <= left_unknown + right_unknown <= 1.0, (
+            f"unknown_kind_fraction (left, right) must sum to <= 1, got {unknown_kind_fraction}"
         )
 
         self._seed = seed
         rng = np.random.RandomState(seed)
         n_samples = len(self.base_dataset)
+        original_labels = self.base_dataset.targets.numpy()
 
-        # Assign kind: unmarked, left, or right from (unmarked, left, right) proportions
-        unmarked_frac, left_frac, right_frac = kind_marked_fraction
+        known_mask = np.isin(original_labels, KNOWN_DIGITS)
+        unknown_mask = np.isin(original_labels, UNKNOWN_DIGITS)
 
+        # Assign kind (left, right, or unmarked) per digit group; remainder is unmarked
         u = rng.rand(n_samples)
         self.kind_arr: np.ndarray = np.empty(n_samples, dtype=object)
-        self.kind_arr[u < unmarked_frac] = "unmarked"
-        self.kind_arr[(unmarked_frac <= u) & (u < unmarked_frac + left_frac)] = "left"
-        self.kind_arr[u >= unmarked_frac + left_frac] = "right"
+        self.kind_arr[known_mask & (u < left_known)] = "left"
+        self.kind_arr[
+            known_mask & (left_known <= u) & (u < left_known + right_known)
+        ] = "right"
+        self.kind_arr[known_mask & (u >= left_known + right_known)] = "unmarked"
+        self.kind_arr[unknown_mask & (u < left_unknown)] = "left"
+        self.kind_arr[
+            unknown_mask & (left_unknown <= u) & (u < left_unknown + right_unknown)
+        ] = "right"
+        self.kind_arr[unknown_mask & (u >= left_unknown + right_unknown)] = "unmarked"
 
-        # kind_known_fraction: (unmarked, left, right) - fraction of each kind that gets known kind_label
-        unmarked_mask = self.kind_arr == "unmarked"
-        left_mask = self.kind_arr == "left"
-        right_mask = self.kind_arr == "right"
-
+        # kind_label: digits 0–4 always labeled correctly (kind_label = kind);
+        # digits 5–9 always unknown (kind_label = "unknown"), but kind can still be
+        # left/right/unmarked (mark may or may not be present)
         self.kind_label_arr: np.ndarray = np.empty(n_samples, dtype=object)
-
-        unmarked_known = rng.rand(n_samples) < kind_known_fraction[0]
-        self.kind_label_arr[unmarked_mask & unmarked_known] = "unmarked"
-        self.kind_label_arr[unmarked_mask & ~unmarked_known] = "unknown"
-
-        left_known = rng.rand(n_samples) < kind_known_fraction[1]
-        self.kind_label_arr[left_mask & left_known] = "left"
-        self.kind_label_arr[left_mask & ~left_known] = "unknown"
-
-        right_known = rng.rand(n_samples) < kind_known_fraction[2]
-        self.kind_label_arr[right_mask & right_known] = "right"
-        self.kind_label_arr[right_mask & ~right_known] = "unknown"
+        self.kind_label_arr[known_mask] = self.kind_arr[known_mask]
+        self.kind_label_arr[unknown_mask] = "unknown"
 
     def _draw_marker(self, image: torch.Tensor, idx: int, kind: str) -> torch.Tensor:
         img = image.clone()
@@ -76,14 +82,13 @@ class MarkedMNIST(Dataset):
 
         row = int(rng.randint(half_size, 28 - half_size))
 
-        # Draw horizontal line
         start_col = col - half_size
         end_col = col + half_size + 1
-        img[0, row, start_col:end_col] = 1.0
-
-        # Draw vertical line
         start_row = row - half_size
         end_row = row + half_size + 1
+
+        # Draw plus (horizontal and vertical lines)
+        img[0, row, start_col:end_col] = 1.0
         img[0, start_row:end_row, col] = 1.0
 
         return img
@@ -96,9 +101,12 @@ class MarkedMNIST(Dataset):
         kind: Kind = self.kind_arr[idx]
         kind_label: KindLabel = self.kind_label_arr[idx]
 
-        if kind != "unmarked":
-            image = self._draw_marker(image, idx, kind)
+        if kind == "left":
             label = (original_label + LABEL_SHIFT) % 10
+            image = self._draw_marker(image, idx, kind)
+        elif kind == "right":
+            label = (original_label - LABEL_SHIFT) % 10
+            image = self._draw_marker(image, idx, kind)
         else:
             label = original_label
 
@@ -106,20 +114,20 @@ class MarkedMNIST(Dataset):
 
 
 def get_dataloaders(
-    kind_marked_fraction: tuple[float, float, float],
-    kind_known_fraction: tuple[float, float, float],
+    known_kind_fraction: tuple[float, float],
+    unknown_kind_fraction: tuple[float, float],
     seed: int = 42,
     batch_size: int = 128,
 ) -> tuple[DataLoader, DataLoader]:
     train_dataset = MarkedMNIST(
-        kind_marked_fraction=kind_marked_fraction,
-        kind_known_fraction=kind_known_fraction,
+        known_kind_fraction=known_kind_fraction,
+        unknown_kind_fraction=unknown_kind_fraction,
         seed=seed,
         train=True,
     )
     test_dataset = MarkedMNIST(
-        kind_marked_fraction=kind_marked_fraction,
-        kind_known_fraction=kind_known_fraction,
+        known_kind_fraction=known_kind_fraction,
+        unknown_kind_fraction=unknown_kind_fraction,
         seed=seed + 1,
         train=False,
     )

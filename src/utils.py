@@ -1,5 +1,16 @@
+import math
+
 import numpy as np
 import torch
+
+
+def format_metric_value(key: str, value: float) -> str:
+    """Format a metric for display; use em dash for empty splits."""
+    if isinstance(value, float) and math.isnan(value):
+        return "—"
+    if "loss" in key:
+        return f"{value:.4f}"
+    return f"{value:.2%}"
 
 
 def set_seed(seed: int) -> None:

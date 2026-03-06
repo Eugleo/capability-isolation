@@ -9,10 +9,7 @@ from torch.utils.data import DataLoader
 from src.classifier import Classifier, evaluate_classifier
 from src.config import Config
 from src.data import get_dataloaders
-from src.utils import get_device, set_seed
-
-KIND_MARKED_FRACTION = (0.5, 0.45, 0.05)
-KIND_KNOWN_FRACTION = (0.5, 1.0, 0.0)
+from src.utils import format_metric_value, get_device, set_seed
 
 
 def train_classifier(
@@ -53,7 +50,9 @@ def train_classifier(
         metrics = evaluate_classifier(model, test_loader, device)
         model.train()
 
-        metric_str = "".join(f"\n  {k}: {v:.2%}" for k, v in metrics.items())
+        metric_str = "".join(
+            f"\n  {k}: {format_metric_value(k, v)}" for k, v in metrics.items()
+        )
         print(
             f"Epoch {epoch + 1}/{config.classifier_epochs} - Loss: {avg_loss:.4f}, "
             f"Train Acc: {train_accuracy:.2%},{metric_str}"
@@ -63,10 +62,7 @@ def train_classifier(
 
 
 def main() -> None:
-    config = Config(
-        kind_marked_fraction=KIND_MARKED_FRACTION,
-        kind_known_fraction=KIND_KNOWN_FRACTION,
-    )
+    config = Config()
     set_seed(config.seed)
     device = get_device()
     print(f"Using device: {device}")
@@ -75,37 +71,11 @@ def main() -> None:
     checkpoint_dir = Path(config.checkpoint_dir)
 
     train_loader, test_loader = get_dataloaders(
-        kind_marked_fraction=config.kind_marked_fraction,
-        kind_known_fraction=config.kind_known_fraction,
+        known_kind_fraction=config.known_kind_fraction,
+        unknown_kind_fraction=config.unknown_kind_fraction,
         seed=config.seed,
         batch_size=config.classifier_batch_size,
     )
-
-    # # classifier_unmarked: train on unmarked only
-    # print("\n" + "=" * 60)
-    # print("Training classifier_unmarked (unmarked only)")
-    # print("=" * 60)
-    # unmarked_train_loader, unmarked_test_loader = get_dataloaders(
-    #     kind_marked_fraction=(1.0, 0.0, 0.0),
-    #     kind_known_fraction=config.kind_known_fraction,
-    #     seed=config.seed,
-    #     batch_size=config.classifier_batch_size,
-    # )
-    # classifier_unmarked = train_classifier(
-    #     config, device, unmarked_train_loader, unmarked_test_loader
-    # )
-    # unmarked_metrics = evaluate_classifier(classifier_unmarked, test_loader, device)
-    # print("classifier_unmarked results:")
-    # for key, value in unmarked_metrics.items():
-    #     print(f"  {key}: {value:.2%}")
-    # torch.save(
-    #     {
-    #         "model_state_dict": classifier_unmarked.state_dict(),
-    #         "metrics": unmarked_metrics,
-    #     },
-    #     checkpoint_dir / "classifier_unmarked.pt",
-    # )
-    # print(f"Saved to {checkpoint_dir / 'classifier_unmarked.pt'}")
 
     # classifier_all: train on full mix
     print("\n" + "=" * 60)
@@ -115,7 +85,7 @@ def main() -> None:
     all_metrics = evaluate_classifier(classifier_all, test_loader, device)
     print("classifier_all results:")
     for key, value in all_metrics.items():
-        print(f"  {key}: {value:.2%}")
+        print(f"  {key}: {format_metric_value(key, value)}")
     torch.save(
         {
             "model_state_dict": classifier_all.state_dict(),

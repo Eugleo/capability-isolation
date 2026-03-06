@@ -1,3 +1,4 @@
+import math
 from typing import Literal
 
 import torch
@@ -52,6 +53,12 @@ def evaluate_gate(
     total_unknown_left = 0
     correct_unknown_right = 0
     total_unknown_right = 0
+    correct_unmarked = 0
+    total_unmarked = 0
+    correct_unmarked_known = 0
+    total_unmarked_known = 0
+    correct_unmarked_unknown = 0
+    total_unmarked_unknown = 0
 
     bc_loss_sum = 0.0
     bc_loss_count = 0
@@ -62,98 +69,148 @@ def evaluate_gate(
 
     with torch.no_grad():
         for batch in dataset:
-            images, _, kinds, kind_labels = batch
-            images = images.to(device)
-            n = len(images)
+            images_BCHW, _, kinds, kind_labels = batch
+            images_BCHW = images_BCHW.to(device)
+            batch_size = len(images_BCHW)
 
-            gate_out = gate(images)
-            pred = (gate_out >= 0.5).squeeze(1)
+            gate_out_B1 = gate(images_BCHW)
+            pred_marked_B = (gate_out_B1 >= 0.5).squeeze(1)
 
-            # Batch BCE loss instead of per-sample
-            targets = torch.tensor(
+            targets_B1 = torch.tensor(
                 [1.0 if k != "unmarked" else 0.0 for k in kinds],
                 device=device,
-                dtype=gate_out.dtype,
+                dtype=gate_out_B1.dtype,
             ).unsqueeze(1)
-            bc_loss_sum += criterion(gate_out, targets).item() * n
-            bc_loss_count += n
+            bc_loss_sum += criterion(gate_out_B1, targets_B1).item() * batch_size
+            bc_loss_count += batch_size
 
-            # Vectorized masks from kinds/kind_labels
-            marked = torch.tensor([k != "unmarked" for k in kinds], device=device)
-            known_marked = torch.tensor(
+            is_marked_B = torch.tensor([k != "unmarked" for k in kinds], device=device)
+            is_unmarked_B = ~is_marked_B
+            is_known_marked_B = torch.tensor(
                 [
                     k != "unmarked" and kl != "unknown"
                     for k, kl in zip(kinds, kind_labels)
                 ],
                 device=device,
             )
-            known_left = torch.tensor(
+            is_known_left_B = torch.tensor(
                 [k == "left" and kl == "left" for k, kl in zip(kinds, kind_labels)],
                 device=device,
             )
-            known_right = torch.tensor(
+            is_known_right_B = torch.tensor(
                 [k == "right" and kl == "right" for k, kl in zip(kinds, kind_labels)],
                 device=device,
             )
-            unknown_marked = torch.tensor(
+            is_unknown_marked_B = torch.tensor(
                 [
                     k != "unmarked" and kl == "unknown"
                     for k, kl in zip(kinds, kind_labels)
                 ],
                 device=device,
             )
-            unknown_left = torch.tensor(
+            is_unknown_left_B = torch.tensor(
                 [k == "left" and kl == "unknown" for k, kl in zip(kinds, kind_labels)],
                 device=device,
             )
-            unknown_right = torch.tensor(
+            is_unknown_right_B = torch.tensor(
                 [k == "right" and kl == "unknown" for k, kl in zip(kinds, kind_labels)],
                 device=device,
             )
+            is_unmarked_known_B = torch.tensor(
+                [
+                    k == "unmarked" and kl == "unmarked"
+                    for k, kl in zip(kinds, kind_labels)
+                ],
+                device=device,
+            )
+            is_unmarked_unknown_B = torch.tensor(
+                [
+                    k == "unmarked" and kl == "unknown"
+                    for k, kl in zip(kinds, kind_labels)
+                ],
+                device=device,
+            )
 
-            pred_f = pred.float()
-            correct_all += (pred == marked).sum().item()
-            total_all += n
+            pred_marked_f_B = pred_marked_B.float()
+            correct_all += (pred_marked_B == is_marked_B).sum().item()
+            total_all += batch_size
 
-            tp_total += (pred & marked).sum().item()
-            fp_total += (pred & ~marked).sum().item()
-            fn_total += ((~pred) & marked).sum().item()
+            tp_total += (pred_marked_B & is_marked_B).sum().item()
+            fp_total += (pred_marked_B & ~is_marked_B).sum().item()
+            fn_total += ((~pred_marked_B) & is_marked_B).sum().item()
 
-            correct_known_marked += (pred_f * known_marked.float()).sum().item()
-            total_known_marked += known_marked.sum().item()
-            correct_known_left += (pred_f * known_left.float()).sum().item()
-            total_known_left += known_left.sum().item()
-            correct_known_right += (pred_f * known_right.float()).sum().item()
-            total_known_right += known_right.sum().item()
-            correct_unknown_marked += (pred_f * unknown_marked.float()).sum().item()
-            total_unknown_marked += unknown_marked.sum().item()
-            correct_unknown_left += (pred_f * unknown_left.float()).sum().item()
-            total_unknown_left += unknown_left.sum().item()
-            correct_unknown_right += (pred_f * unknown_right.float()).sum().item()
-            total_unknown_right += unknown_right.sum().item()
+            correct_known_marked += (
+                (pred_marked_f_B * is_known_marked_B.float()).sum().item()
+            )
+            total_known_marked += is_known_marked_B.sum().item()
+            correct_known_left += (
+                (pred_marked_f_B * is_known_left_B.float()).sum().item()
+            )
+            total_known_left += is_known_left_B.sum().item()
+            correct_known_right += (
+                (pred_marked_f_B * is_known_right_B.float()).sum().item()
+            )
+            total_known_right += is_known_right_B.sum().item()
+            correct_unknown_marked += (
+                (pred_marked_f_B * is_unknown_marked_B.float()).sum().item()
+            )
+            total_unknown_marked += is_unknown_marked_B.sum().item()
+            correct_unknown_left += (
+                (pred_marked_f_B * is_unknown_left_B.float()).sum().item()
+            )
+            total_unknown_left += is_unknown_left_B.sum().item()
+            correct_unknown_right += (
+                (pred_marked_f_B * is_unknown_right_B.float()).sum().item()
+            )
+            total_unknown_right += is_unknown_right_B.sum().item()
 
-    bc_loss = bc_loss_sum / bc_loss_count if bc_loss_count > 0 else 0.0
+            pred_unmarked_B = ~pred_marked_B
+            correct_unmarked += (pred_unmarked_B & is_unmarked_B).sum().item()
+            total_unmarked += is_unmarked_B.sum().item()
+            correct_unmarked_known += (
+                (pred_unmarked_B.float() * is_unmarked_known_B.float()).sum().item()
+            )
+            total_unmarked_known += is_unmarked_known_B.sum().item()
+            correct_unmarked_unknown += (
+                (pred_unmarked_B.float() * is_unmarked_unknown_B.float()).sum().item()
+            )
+            total_unmarked_unknown += is_unmarked_unknown_B.sum().item()
+
+    bc_loss = bc_loss_sum / bc_loss_count if bc_loss_count > 0 else math.nan
 
     tp = tp_total
     fp = fp_total
     fn = fn_total
-    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    precision = tp / (tp + fp) if (tp + fp) > 0 else math.nan
+    recall = tp / (tp + fn) if (tp + fn) > 0 else math.nan
 
     def _acc(c: int, t: int) -> float:
-        return c / t if t > 0 else 0.0
+        return c / t if t > 0 else math.nan
 
     return {
         "gate/all/accuracy": _acc(correct_all, total_all),
         "gate/marked/precision": precision,
         "gate/marked/recall": recall,
+        "gate/unmarked/accuracy": _acc(correct_unmarked, total_unmarked),
+        "gate/unmarked/known/accuracy": _acc(
+            correct_unmarked_known, total_unmarked_known
+        ),
+        "gate/unmarked/unknown/accuracy": _acc(
+            correct_unmarked_unknown, total_unmarked_unknown
+        ),
         "gate/marked/known/accuracy": _acc(correct_known_marked, total_known_marked),
-        "gate/marked/left/accuracy": _acc(correct_known_left, total_known_left),
-        "gate/marked/right/accuracy": _acc(correct_known_right, total_known_right),
+        "gate/marked/known/left/accuracy": _acc(correct_known_left, total_known_left),
+        "gate/marked/known/right/accuracy": _acc(
+            correct_known_right, total_known_right
+        ),
         "gate/marked/unknown/accuracy": _acc(
             correct_unknown_marked, total_unknown_marked
         ),
-        "gate/left/unknown/accuracy": _acc(correct_unknown_left, total_unknown_left),
-        "gate/right/unknown/accuracy": _acc(correct_unknown_right, total_unknown_right),
+        "gate/marked/unknown/left/accuracy": _acc(
+            correct_unknown_left, total_unknown_left
+        ),
+        "gate/marked/unknown/right/accuracy": _acc(
+            correct_unknown_right, total_unknown_right
+        ),
         "gate/bc_loss": bc_loss,
     }

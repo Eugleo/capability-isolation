@@ -86,7 +86,7 @@ def evaluate_classifier(
                         correct_right += 1
 
     def _acc(c: int, t: int) -> float:
-        return c / t if t > 0 else 0.0
+        return c / t if t > 0 else float("nan")
 
     return {
         "classifier/all/accuracy": _acc(correct_all, total_all),

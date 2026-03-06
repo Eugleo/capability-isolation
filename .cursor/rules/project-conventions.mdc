@@ -1,0 +1,28 @@
+---
+description: Project-wide conventions for tooling, environment, and scientific methodology
+alwaysApply: true
+---
+
+# Project Conventions
+
+## Tooling
+
+- **uv** manages all dependencies and Python execution. Use `uv add` to add packages, `uv run` to execute scripts. Never use `pip` or raw `python` directly.
+- Python 3.11+ on macOS (MPS). Code must also work on CUDA.
+
+## Device Selection
+
+Always select device with future CUDA portability in mind:
+
+```python
+device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
+```
+
+## Scientific Methodology
+
+This is a research project. Prioritize:
+
+- **Reproducibility**: seed RNGs explicitly, log hyperparameters, avoid hidden state
+- **Modularity**: small pure functions that are easy to swap, rewrite, or ablate
+- **80/20 efficiency**: do the obvious optimizations (batched tensor ops, `torch.no_grad()` where gradients aren't needed) but don't over-engineer; premature optimization kills iteration speed
+- **Readability over cleverness**: someone revisiting this in 3 months should understand what's happening immediately

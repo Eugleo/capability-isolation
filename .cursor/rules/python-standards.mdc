@@ -1,0 +1,43 @@
+---
+description: Python coding standards — naming, tensor conventions, einops, no docstrings
+globs: "**/*.py"
+alwaysApply: false
+---
+
+# Python Standards
+
+## No Docstrings
+
+Do not write docstrings. Let clear naming and type hints speak for themselves.
+
+## Naming Conventions
+
+Use concise, descriptive names that encode type intent:
+
+| Pattern | Usage | Example |
+|---------|-------|---------|
+| `is_*`, `has_*` | booleans | `is_causal`, `has_bias` |
+| `*s` (plural) | lists / sequences | `tokens`, `layers`, `logits` |
+| `tensor_DIM` suffixes | tensors with shape info | `attention_BHT`, `embeddings_BD` |
+| descriptive nouns | scalars, configs | `num_heads`, `learning_rate` |
+
+```python
+# bad
+x = model(y)
+res = x.view(b, h, t)
+
+# good
+logits_BV = model(token_ids_BT)
+attention_BHT = logits_BV.view(batch_size, num_heads, seq_len)
+```
+
+## Tensor Operations
+
+Use **einops** for rearrange, reduce, repeat, and einsum — not raw `.view()`, `.permute()`, `.reshape()`. Use short but readable names for the dimensions whenever possible.
+
+## Efficiency (80/20)
+
+- Batch tensor operations instead of Python loops
+- Wrap inference / non-training paths in `torch.no_grad()` or use `@torch.inference_mode()`
+- Detach tensors before logging: `loss.detach().item()`
+- Use `torch.compile` when it helps, but don't contort code for it

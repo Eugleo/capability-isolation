@@ -92,6 +92,6 @@ def evaluate_classifier(
         "classifier/all/accuracy": _acc(correct_all, total_all),
         "classifier/unmarked/accuracy": _acc(correct_unmarked, total_unmarked),
         "classifier/marked/accuracy": _acc(correct_marked, total_marked),
-        "classifier/left/accuracy": _acc(correct_left, total_left),
-        "classifier/right/accuracy": _acc(correct_right, total_right),
+        "classifier/marked/left/accuracy": _acc(correct_left, total_left),
+        "classifier/marked/right/accuracy": _acc(correct_right, total_right),
     }

@@ -53,12 +53,10 @@ def train_classifier(
         metrics = evaluate_classifier(model, test_loader, device)
         model.train()
 
+        metric_str = "".join(f"\n  {k}: {v:.2%}" for k, v in metrics.items())
         print(
             f"Epoch {epoch + 1}/{config.classifier_epochs} - Loss: {avg_loss:.4f}, "
-            f"Train Acc: {train_accuracy:.2%}, "
-            f"Test all: {metrics['classifier/all/accuracy']:.2%}, "
-            f"unmarked: {metrics['classifier/unmarked/accuracy']:.2%}, "
-            f"marked: {metrics['classifier/marked/accuracy']:.2%}"
+            f"Train Acc: {train_accuracy:.2%},{metric_str}"
         )
 
     return model

@@ -20,6 +20,49 @@ class GatedSystem(nn.Module):
         self.model_safe = model_safe
         self.model_unsafe = model_unsafe
 
+    def save(
+        self,
+        path: Path | str,
+        *,
+        gate_metrics: Optional[dict[str, float]] = None,
+        system_metrics: Optional[dict[str, float]] = None,
+    ) -> None:
+        """Save the full system to a checkpoint file."""
+        path = Path(path)
+        data = {
+            "gate_state_dict": self.gate.state_dict(),
+            "model_safe_state_dict": self.model_safe.state_dict(),
+            "model_unsafe_state_dict": self.model_unsafe.state_dict(),
+        }
+        if gate_metrics is not None:
+            data["gate_metrics"] = gate_metrics
+        if system_metrics is not None:
+            data["system_metrics"] = system_metrics
+        torch.save(data, path)
+
+    @classmethod
+    def load(
+        cls,
+        path: Path | str,
+        *,
+        device: Optional[torch.device] = None,
+    ) -> "GatedSystem":
+        """Load a GatedSystem from a checkpoint file."""
+        path = Path(path)
+        map_location = device if device is not None else "cpu"
+        data = torch.load(path, map_location=map_location, weights_only=True)
+        gate = Gate()
+        gate.load_state_dict(data["gate_state_dict"])
+        model_safe = Classifier()
+        model_safe.load_state_dict(data["model_safe_state_dict"])
+        model_unsafe = Classifier()
+        model_unsafe.load_state_dict(data["model_unsafe_state_dict"])
+        if device is not None:
+            gate = gate.to(device)
+            model_safe = model_safe.to(device)
+            model_unsafe = model_unsafe.to(device)
+        return cls(gate=gate, model_safe=model_safe, model_unsafe=model_unsafe)
+
     def forward(
         self,
         images_BCHW: torch.Tensor,
@@ -205,30 +248,37 @@ def main() -> None:
     print(f"Using device: {device}")
 
     checkpoint_dir = Path(config.checkpoint_dir)
-    gate = Gate().to(device)
-    gate.load_state_dict(
-        torch.load(
-            checkpoint_dir / "gate_known.pt", map_location=device, weights_only=True
-        )["model_state_dict"]
-    )
-    model_safe = Classifier().to(device)
-    model_safe.load_state_dict(
-        torch.load(
-            checkpoint_dir / "classifier_unlearnt_safe.pt",
-            map_location=device,
-            weights_only=True,
-        )["model_state_dict"]
-    )
-    model_unsafe = Classifier().to(device)
-    model_unsafe.load_state_dict(
-        torch.load(
-            checkpoint_dir / "classifier_all.pt",
-            map_location=device,
-            weights_only=True,
-        )["model_state_dict"]
-    )
-
-    system = GatedSystem(gate=gate, model_safe=model_safe, model_unsafe=model_unsafe)
+    system_path = checkpoint_dir / "system.pt"
+    if system_path.exists():
+        system = GatedSystem.load(system_path, device=device)
+    else:
+        gate = Gate().to(device)
+        gate.load_state_dict(
+            torch.load(
+                checkpoint_dir / "gate_known.pt",
+                map_location=device,
+                weights_only=True,
+            )["model_state_dict"]
+        )
+        model_safe = Classifier().to(device)
+        model_safe.load_state_dict(
+            torch.load(
+                checkpoint_dir / "classifier_unlearnt_safe.pt",
+                map_location=device,
+                weights_only=True,
+            )["model_state_dict"]
+        )
+        model_unsafe = Classifier().to(device)
+        model_unsafe.load_state_dict(
+            torch.load(
+                checkpoint_dir / "classifier_all.pt",
+                map_location=device,
+                weights_only=True,
+            )["model_state_dict"]
+        )
+        system = GatedSystem(
+            gate=gate, model_safe=model_safe, model_unsafe=model_unsafe
+        )
 
     _, test_loader = get_dataloaders(
         known_kind_fraction=config.known_kind_fraction,

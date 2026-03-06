@@ -11,10 +11,10 @@ class Config:
     # Paths
     checkpoint_dir: str = "checkpoints"
 
-    # Training Phase 1 (original model)
-    orig_epochs: int = 10
-    orig_lr: float = 1e-3
-    orig_batch_size: int = 128
+    # Classifier training
+    classifier_epochs: int = 10
+    classifier_lr: float = 1e-3
+    classifier_batch_size: int = 128
 
     # Training Phase 2 (isolation)
     finetune_epochs: int = 20

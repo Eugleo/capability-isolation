@@ -2,7 +2,7 @@ from typing import Literal
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Subset
 from torchvision import datasets, transforms
 
 Kind = Literal["unmarked", "left", "right"]
@@ -133,6 +133,44 @@ def get_dataloaders(
     )
     train_loader = DataLoader(
         train_dataset, batch_size=batch_size, shuffle=True, num_workers=0
+    )
+    test_loader = DataLoader(
+        test_dataset, batch_size=batch_size, shuffle=False, num_workers=0
+    )
+    return train_loader, test_loader
+
+
+def get_filtered_dataloaders(
+    known_kind_fraction: tuple[float, float],
+    unknown_kind_fraction: tuple[float, float],
+    seed: int = 42,
+    batch_size: int = 128,
+    *,
+    filter_kinds: tuple[str, ...],
+) -> tuple[DataLoader, DataLoader]:
+    """Get dataloaders with train filtered by kind; test is always unfiltered."""
+    train_dataset = MarkedMNIST(
+        known_kind_fraction=known_kind_fraction,
+        unknown_kind_fraction=unknown_kind_fraction,
+        seed=seed,
+        train=True,
+    )
+    test_dataset = MarkedMNIST(
+        known_kind_fraction=known_kind_fraction,
+        unknown_kind_fraction=unknown_kind_fraction,
+        seed=seed + 1,
+        train=False,
+    )
+
+    train_indices = [
+        i
+        for i in range(len(train_dataset))
+        if train_dataset.kind_arr[i] in filter_kinds
+    ]
+    train_subset = Subset(train_dataset, train_indices)
+
+    train_loader = DataLoader(
+        train_subset, batch_size=batch_size, shuffle=True, num_workers=0
     )
     test_loader = DataLoader(
         test_dataset, batch_size=batch_size, shuffle=False, num_workers=0

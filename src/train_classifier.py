@@ -5,6 +5,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 import matplotlib.pyplot as plt
+import numpy as np
 import polars as pl
 import torch
 import torch.nn as nn
@@ -105,35 +106,64 @@ def build_eval_dataframe(
     return pl.DataFrame(rows)
 
 
+# Qualitative palette for classification (colorblind-friendly, distinct)
+CLASSIFICATION_PALETTE = [
+    "#0173b2",
+    "#de8f05",
+    "#029e73",
+    "#cc78bc",
+    "#ca9161",
+    "#fbafe4",
+    "#949494",
+    "#ece133",
+    "#56b4e9",
+    "#d55e00",
+]
+
+
 def plot_classifier_evaluation(
     df: pl.DataFrame,
     save_path: Path | str,
     *,
     model_colors: dict[str, str] | None = None,
+    single_legend: bool = False,
+    jitter: float = 0.0,
+    alpha: float = 1.0,
+    use_palette: bool = False,
 ) -> None:
     """3-panel plot: accuracy over epochs, one panel per data type."""
     if df.is_empty():
         return
 
     data_types = ["unmarked", "marked-left", "marked-right"]
-    n_models = df["model"].n_unique()
+    model_names = df["model"].unique().sort().to_list()
+    n_models = len(model_names)
     fig_h = max(5, 3 + n_models * 0.3)
     fig, axes = plt.subplots(1, 3, figsize=(12, fig_h), sharey=True)
 
-    default_colors = {
-        "classifier_all": "#377eb8",
-        "classifier_marked": "#e41a1c",
-        "classifier_unmarked": "#4daf4a",
-        "classifier_pos=u_neg=m": "#ff7f00",
-        "classifier_pos=u_neg=m+unk": "#a65628",
-        "classifier_pos=u+unk_neg=m": "#e6550d",
-        "classifier_pos=u+unk_neg=m+unk": "#d95f02",
-        "classifier_pos=m_neg=u": "#999999",
-        "classifier_pos=m_neg=u+unk": "#f781bf",
-        "classifier_pos=m+unk_neg=u": "#cab2d6",
-        "classifier_pos=m+unk_neg=u+unk": "#a6761d",
-    }
-    colors = {**default_colors, **(model_colors or {})}
+    if use_palette:
+        colors = {
+            m: CLASSIFICATION_PALETTE[i % len(CLASSIFICATION_PALETTE)]
+            for i, m in enumerate(model_names)
+        }
+    else:
+        default_colors = {
+            "classifier_all": "#377eb8",
+            "classifier_marked": "#e41a1c",
+            "classifier_unmarked": "#4daf4a",
+            "classifier_pos=u_neg=m": "#ff7f00",
+            "classifier_pos=u_neg=m+unk": "#a65628",
+            "classifier_pos=u+unk_neg=m": "#e6550d",
+            "classifier_pos=u+unk_neg=m+unk": "#d95f02",
+            "classifier_pos=m_neg=u": "#999999",
+            "classifier_pos=m_neg=u+unk": "#f781bf",
+            "classifier_pos=m+unk_neg=u": "#cab2d6",
+            "classifier_pos=m+unk_neg=u+unk": "#a6761d",
+        }
+        colors = {**default_colors, **(model_colors or {})}
+
+    rng = np.random.default_rng(42)
+    legend_handles: dict[str, plt.Line2D] = {}
 
     for ax, data_type in zip(axes, data_types):
         sub_df = df.filter(pl.col("data_type") == data_type)
@@ -144,20 +174,39 @@ def plot_classifier_evaluation(
             model_sub = sub_df.filter(pl.col("model") == model_name).sort("epoch")
             if model_sub.is_empty():
                 continue
-            ax.plot(
-                model_sub["epoch"].to_list(),
-                model_sub["accuracy"].to_list(),
+            epochs = np.array(model_sub["epoch"].to_list())
+            accs = np.array(model_sub["accuracy"].to_list())
+            if jitter > 0:
+                epochs = epochs + rng.uniform(-jitter, jitter, size=len(epochs))
+            (line,) = ax.plot(
+                epochs,
+                accs,
                 label=model_name,
                 color=colors.get(model_name, "#888888"),
+                alpha=alpha,
             )
+            if single_legend and model_name not in legend_handles:
+                legend_handles[model_name] = line
         ax.set_xlabel("Epoch")
         ax.set_ylabel("Accuracy")
         ax.set_title(data_type)
         ax.set_ylim(0, 1)
-        ax.legend(loc="best", fontsize=8)
+        if not single_legend:
+            ax.legend(loc="best", fontsize=8)
         ax.grid(True, alpha=0.3)
 
-    fig.tight_layout()
+    if single_legend and legend_handles:
+        fig.legend(
+            legend_handles.values(),
+            legend_handles.keys(),
+            loc="upper center",
+            bbox_to_anchor=(0.5, -0.02),
+            ncol=min(4, len(legend_handles)),
+            fontsize=8,
+        )
+        fig.tight_layout(rect=[0, 0.08, 1, 1])
+    else:
+        fig.tight_layout()
     fig.savefig(save_path, dpi=150)
     plt.close(fig)
 

@@ -180,36 +180,49 @@ def main() -> None:
         negative: tuple[str, ...],
         train_loader: DataLoader,
     ) -> None:
-        model = Classifier().to(device)
-        model.load_state_dict(base_model.state_dict())
-        frozen = Classifier().to(device)
-        frozen.load_state_dict(base_model.state_dict())
-        frozen.eval()
-        for p in frozen.parameters():
-            p.requires_grad_(False)
-
-        print("\n" + "=" * 60)
-        print(f"Training {name} (positive={positive}, negative={negative})")
-        print("=" * 60)
-        model, history = train_entanglement_unlearn(
-            model,
-            frozen,
-            train_loader,
-            test_loader,
-            device,
-            epochs=config.classifier_epochs,
-            lr=config.classifier_lr,
-            positive_kind_labels=positive,
-            negative_kind_labels=negative,
-        )
-        model_histories[name] = history
-
         save_dir = checkpoint_dir / name
-        save_dir.mkdir(parents=True, exist_ok=True)
-        model.save(save_dir / "model.pt")
-        with open(save_dir / "config.json", "w") as f:
-            json.dump(asdict(config), f, indent=2)
-        print(f"Saved to {save_dir / 'model.pt'}")
+        model_path = save_dir / "model.pt"
+
+        if model_path.exists():
+            print("\n" + "=" * 60)
+            print(f"Loading {name} from cache")
+            print("=" * 60)
+            model = Classifier.load(model_path, device=device)
+        else:
+            model = Classifier().to(device)
+            model.load_state_dict(base_model.state_dict())
+            frozen = Classifier().to(device)
+            frozen.load_state_dict(base_model.state_dict())
+            frozen.eval()
+            for p in frozen.parameters():
+                p.requires_grad_(False)
+
+            print("\n" + "=" * 60)
+            print(f"Training {name} (positive={positive}, negative={negative})")
+            print("=" * 60)
+            model, _ = train_entanglement_unlearn(
+                model,
+                frozen,
+                train_loader,
+                test_loader,
+                device,
+                epochs=config.classifier_epochs,
+                lr=config.classifier_lr,
+                positive_kind_labels=positive,
+                negative_kind_labels=negative,
+            )
+
+            save_dir.mkdir(parents=True, exist_ok=True)
+            model.save(model_path)
+            with open(save_dir / "config.json", "w") as f:
+                json.dump(asdict(config), f, indent=2)
+            print(f"Saved to {model_path}")
+
+        metrics = evaluate_classifier(model, test_loader, device)
+        print(f"{name} evaluation:")
+        for k, v in metrics.items():
+            print(f"  {k}: {format_metric_value(k, v)}")
+        model_histories[name] = [{"epoch": 1.0, **metrics}]
 
     # Keep unmarked variants, remove marked variants (u=unmarked, m=marked, unk=unknown)
     _run_unlearn(
@@ -260,9 +273,13 @@ def main() -> None:
     # Evaluation plot
     if model_histories:
         eval_df = build_eval_dataframe(model_histories)
-        eval_df.write_csv(checkpoint_dir / "classifier_unlearn_evaluation.csv")
         plot_classifier_evaluation(
-            eval_df, checkpoint_dir / "classifier_unlearn_evaluation.png"
+            eval_df,
+            checkpoint_dir / "classifier_unlearn_evaluation.png",
+            single_legend=True,
+            jitter=0.03,
+            alpha=0.5,
+            use_palette=True,
         )
         print(
             f"\nSaved evaluation plot to {checkpoint_dir / 'classifier_unlearn_evaluation.png'}"

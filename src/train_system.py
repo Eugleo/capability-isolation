@@ -348,7 +348,9 @@ def _create_experiment_dir() -> Path:
 
 def main() -> None:
     config = Config(
-        system_init_safe_model="classifier_unlearnt_safe.pt",
+        system_epochs=10,
+        system_init_safe_model="classifier_all",
+        system_init_unsafe_model="classifier_all",
     )
     set_seed(config.seed)
     device = get_device()
@@ -380,21 +382,11 @@ def main() -> None:
                 weights_only=True,
             )["model_state_dict"]
         )
-    model_safe = Classifier().to(device)
-    model_safe.load_state_dict(
-        torch.load(
-            checkpoint_dir / config.system_init_safe_model,
-            map_location=device,
-            weights_only=True,
-        )["model_state_dict"]
+    model_safe = Classifier.load(
+        checkpoint_dir / config.system_init_safe_model, device=device
     )
-    model_unsafe = Classifier().to(device)
-    model_unsafe.load_state_dict(
-        torch.load(
-            checkpoint_dir / config.system_init_unsafe_model,
-            map_location=device,
-            weights_only=True,
-        )["model_state_dict"]
+    model_unsafe = Classifier.load(
+        checkpoint_dir / config.system_init_unsafe_model, device=device
     )
 
     # Freeze unsafe model
@@ -431,21 +423,9 @@ def main() -> None:
                 weights_only=True,
             )["model_state_dict"]
         )
-        model_safe_bl = Classifier().to(device)
-        model_safe_bl.load_state_dict(
-            torch.load(
-                checkpoint_dir / safe_model_path,
-                map_location=device,
-                weights_only=True,
-            )["model_state_dict"]
-        )
-        model_unsafe_bl = Classifier().to(device)
-        model_unsafe_bl.load_state_dict(
-            torch.load(
-                checkpoint_dir / "classifier_all.pt",
-                map_location=device,
-                weights_only=True,
-            )["model_state_dict"]
+        model_safe_bl = Classifier.load(checkpoint_dir / safe_model_path, device=device)
+        model_unsafe_bl = Classifier.load(
+            checkpoint_dir / "classifier_all", device=device
         )
         return GatedSystem(
             gate=gate_bl,
@@ -453,8 +433,8 @@ def main() -> None:
             model_unsafe=model_unsafe_bl,
         )
 
-    system_baseline_unsafe = _build_baseline_system("classifier_unlearnt_unsafe.pt")
-    system_baseline_safe = _build_baseline_system("classifier_unlearnt_safe.pt")
+    system_baseline_unsafe = _build_baseline_system("classifier_pos=u+unk_neg=m")
+    system_baseline_safe = _build_baseline_system("classifier_pos=u_neg=m")
     baseline_unsafe_system_metrics = evaluate_gated_system(
         system_baseline_unsafe, test_loader, device
     )

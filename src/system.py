@@ -260,22 +260,8 @@ def main() -> None:
                 weights_only=True,
             )["model_state_dict"]
         )
-        model_safe = Classifier().to(device)
-        model_safe.load_state_dict(
-            torch.load(
-                checkpoint_dir / "classifier_unlearnt_safe.pt",
-                map_location=device,
-                weights_only=True,
-            )["model_state_dict"]
-        )
-        model_unsafe = Classifier().to(device)
-        model_unsafe.load_state_dict(
-            torch.load(
-                checkpoint_dir / "classifier_all.pt",
-                map_location=device,
-                weights_only=True,
-            )["model_state_dict"]
-        )
+        model_safe = Classifier.load(checkpoint_dir / "classifier_pos=u_neg=m", device=device)
+        model_unsafe = Classifier.load(checkpoint_dir / "classifier_all", device=device)
         system = GatedSystem(
             gate=gate, model_safe=model_safe, model_unsafe=model_unsafe
         )

@@ -8,7 +8,6 @@ from pathlib import Path
 from typing import Literal
 
 import matplotlib.pyplot as plt
-import polars as pl
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -128,7 +127,7 @@ def train_system(
     train_loader: DataLoader,
     test_loader: DataLoader,
     system: GatedSystem,
-) -> tuple[GatedSystem, list[dict[str, float]]]:
+) -> tuple[GatedSystem, list[dict[str, float]], list[dict[str, float]]]:
     # Only train gate and safe model
     params = list(system.gate.parameters()) + list(system.model_safe.parameters())
     optimizer = optim.Adam(params, lr=config.system_lr)
@@ -138,6 +137,7 @@ def train_system(
     w_div = config.system_divergence_weight
 
     gate_history: list[dict[str, float]] = []
+    epoch_eval_history: list[dict[str, float]] = []
     step = 0
 
     for epoch in range(config.system_epochs):
@@ -190,7 +190,15 @@ def train_system(
             f"\n  System:{system_str}"
         )
 
-    return system, gate_history
+        epoch_eval_history.append(
+            {
+                "epoch": float(epoch + 1),
+                "loss": avg_loss,
+                **_merge_metrics(system_metrics, gate_metrics),
+            }
+        )
+
+    return system, gate_history, epoch_eval_history
 
 
 def plot_gate_history(
@@ -229,108 +237,137 @@ def plot_gate_history(
     plt.close(fig)
 
 
-def build_comparison_dataframe(
-    models: list[tuple[str, dict[str, float], dict[str, float]]],
-) -> pl.DataFrame:
-    """Build a long-format DataFrame from (model_name, system_metrics, gate_metrics) tuples.
-
-    Columns: model, metric, value.
-    """
-    rows: list[dict[str, str | float]] = []
-    for name, sys_m, gate_m in models:
-        merged = {**sys_m, **gate_m}
-        for k, v in merged.items():
-            metric = k.removeprefix("@/")
-            val = 0.0 if v is None or (isinstance(v, float) and math.isnan(v)) else v
-            rows.append({"model": name, "metric": metric, "value": val})
-    return pl.DataFrame(rows)
+def _merge_metrics(*metric_dicts: dict[str, float]) -> dict[str, float]:
+    merged: dict[str, float] = {}
+    for metric_dict in metric_dicts:
+        for key, value in metric_dict.items():
+            metric = key.removeprefix("@/")
+            merged[metric] = (
+                0.0
+                if value is None or (isinstance(value, float) and math.isnan(value))
+                else value
+            )
+    return merged
 
 
-def plot_system_comparison(df: pl.DataFrame, save_path: Path | str) -> None:
-    """4-panel plot comparing models from a metrics DataFrame.
+def plot_system_comparison(
+    trained_history: list[dict[str, float]],
+    baselines: list[tuple[str, dict[str, float], dict[str, float]]],
+    save_path: Path | str,
+) -> None:
+    """4-panel line plot of eval metrics over epochs plus fixed baselines."""
+    if not trained_history:
+        return
 
-    Expects columns: model, metric, value.
-    Panels: (1) system overall, (2) safe_only on unmarked, (3) safe_only on marked,
-    (4) gate precision vs recall.
-    """
     fig, axes = plt.subplots(2, 2, figsize=(10, 10))
 
-    names = df["model"].unique().to_list()
-    n = len(names)
     color_map = {
         "trained": "#377eb8",
         "unlearnt (unsafe)": "#e41a1c",
         "unlearnt (safe)": "#4daf4a",
+        "gated split": "#984ea3",
     }
-    colors = [color_map.get(n, "#888888") for n in names]
-    x_pos = list(range(n))
-    width = max(0.25, 0.8 / n)
+    legend_handles: dict[str, plt.Artist] = {}
+    epochs = [entry["epoch"] for entry in trained_history]
+    baseline_metrics = [
+        (name, _merge_metrics(system_metrics, gate_metrics))
+        for name, system_metrics, gate_metrics in baselines
+    ]
 
-    def _vals(metric: str) -> list[float]:
-        sub = df.filter(pl.col("metric") == metric)
-        lookup = dict(zip(sub["model"].to_list(), sub["value"].to_list()))
-        return [lookup.get(m, 0.0) for m in names]
-
-    # Panel 1: Overall system performance
-    ax = axes[0, 0]
-    ax.bar(
-        x_pos, _vals("system/all/accuracy"), width=width, color=colors, tick_label=names
-    )
-    ax.set_ylabel("Accuracy")
-    ax.set_title("System overall")
-    ax.set_ylim(0, 1)
-
-    # Panel 2: Safe-only on unmarked
-    ax = axes[0, 1]
-    ax.bar(
-        x_pos,
-        _vals("safe_only/unmarked/accuracy"),
-        width=width,
-        color=colors,
-        tick_label=names,
-    )
-    ax.set_ylabel("Accuracy")
-    ax.set_title("Safe-only on unmarked")
-    ax.set_ylim(0, 1)
-
-    # Panel 3: Safe-only on marked
-    ax = axes[1, 0]
-    ax.bar(
-        x_pos,
-        _vals("safe_only/marked/accuracy"),
-        width=width,
-        color=colors,
-        tick_label=names,
-    )
-    ax.set_ylabel("Accuracy")
-    ax.set_title("Safe-only on marked")
-    ax.set_ylim(0, 1)
-
-    # Panel 4: Gate precision (y) vs recall (x)
-    ax = axes[1, 1]
-    recall_df = df.filter(pl.col("metric") == "gate/marked/recall")
-    prec_df = df.filter(pl.col("metric") == "gate/marked/precision")
-    for i, name in enumerate(names):
-        recall = recall_df.filter(pl.col("model") == name)["value"]
-        prec = prec_df.filter(pl.col("model") == name)["value"]
-        if len(recall) > 0 and len(prec) > 0:
-            ax.scatter(
-                recall[0],
-                prec[0],
+    metric_panels = [
+        ("system/all/accuracy", "System overall"),
+        ("safe_only/unmarked/accuracy", "Safe-only on unmarked"),
+        ("safe_only/marked/accuracy", "Safe-only on marked"),
+    ]
+    for ax, (metric, title) in zip([axes[0, 0], axes[0, 1], axes[1, 0]], metric_panels):
+        trained_values = [entry.get(metric, 0.0) for entry in trained_history]
+        (line,) = ax.plot(
+            epochs,
+            trained_values,
+            label="trained",
+            color=color_map["trained"],
+            marker="o",
+        )
+        legend_handles.setdefault("trained", line)
+        for name, metrics in baseline_metrics:
+            color = color_map.get(name, "#888888")
+            baseline_values = [metrics.get(metric, 0.0)] * len(epochs)
+            (baseline_line,) = ax.plot(
+                epochs,
+                baseline_values,
                 label=name,
-                s=100,
-                color=colors[i],
-                zorder=5,
+                color=color,
+                linestyle="--",
             )
+            legend_handles.setdefault(name, baseline_line)
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel("Accuracy")
+        ax.set_title(title)
+        ax.set_ylim(0, 1)
+        ax.grid(True, alpha=0.3)
+
+    ax = axes[1, 1]
+    trained_recalls = [
+        entry.get("gate/marked/recall", 0.0) for entry in trained_history
+    ]
+    trained_precisions = [
+        entry.get("gate/marked/precision", 0.0) for entry in trained_history
+    ]
+    (pr_line,) = ax.plot(
+        trained_recalls,
+        trained_precisions,
+        color=color_map["trained"],
+        label="trained",
+    )
+    legend_handles["trained"] = pr_line
+    denom = max(len(trained_history) - 1, 1)
+    for idx, (recall, precision) in enumerate(zip(trained_recalls, trained_precisions)):
+        alpha = 0.25 + 0.75 * (idx / denom)
+        ax.scatter(
+            recall,
+            precision,
+            color=color_map["trained"],
+            s=100,
+            alpha=alpha,
+            zorder=5,
+        )
+
+    for name, metrics in baseline_metrics:
+        color = color_map.get(name, "#888888")
+        point = ax.scatter(
+            metrics.get("gate/marked/recall", 0.0),
+            metrics.get("gate/marked/precision", 0.0),
+            label=name,
+            color=color,
+            marker="X",
+            s=110,
+            zorder=6,
+        )
+        legend_handles.setdefault(name, point)
+
     ax.set_xlabel("Gate recall")
     ax.set_ylabel("Gate precision")
     ax.set_title("Gate precision vs recall")
-    ax.legend(loc="best")
     ax.set_xlim(0, 1)
     ax.set_ylim(0, 1)
     ax.grid(True, alpha=0.3)
+    ax.text(
+        0.03,
+        0.03,
+        "Darker blue points are later epochs.",
+        transform=ax.transAxes,
+        fontsize=9,
+    )
 
-    fig.tight_layout()
+    fig.legend(
+        legend_handles.values(),
+        legend_handles.keys(),
+        loc="upper center",
+        bbox_to_anchor=(0.5, 0.02),
+        ncol=min(4, len(legend_handles)),
+        fontsize=9,
+    )
+    fig.tight_layout(rect=[0, 0.06, 1, 1])
     fig.savefig(save_path, dpi=150)
     plt.close(fig)
 
@@ -349,8 +386,8 @@ def _create_experiment_dir() -> Path:
 def main() -> None:
     config = Config(
         system_epochs=10,
-        system_init_safe_model="classifier_all",
-        system_init_unsafe_model="classifier_all",
+        system_init_safe_model="classifier_all/model.pt",
+        system_init_unsafe_model="classifier_all/model.pt",
     )
     set_seed(config.seed)
     device = get_device()
@@ -398,7 +435,7 @@ def main() -> None:
     print("\n" + "=" * 60)
     print("Training system (gate + safe model)")
     print("=" * 60)
-    system, gate_history = train_system(
+    system, gate_history, epoch_eval_history = train_system(
         config, device, train_loader, test_loader, system
     )
 
@@ -414,7 +451,9 @@ def main() -> None:
     for key, value in system_metrics.items():
         print(f"  {key}: {format_metric_value(key, value)}")
 
-    def _build_baseline_system(safe_model_path: str) -> GatedSystem:
+    def _build_baseline_system(
+        safe_model_path: str, unsafe_model_path: str
+    ) -> GatedSystem:
         gate_bl = Gate().to(device)
         gate_bl.load_state_dict(
             torch.load(
@@ -425,7 +464,7 @@ def main() -> None:
         )
         model_safe_bl = Classifier.load(checkpoint_dir / safe_model_path, device=device)
         model_unsafe_bl = Classifier.load(
-            checkpoint_dir / "classifier_all", device=device
+            checkpoint_dir / unsafe_model_path, device=device
         )
         return GatedSystem(
             gate=gate_bl,
@@ -433,8 +472,15 @@ def main() -> None:
             model_unsafe=model_unsafe_bl,
         )
 
-    system_baseline_unsafe = _build_baseline_system("classifier_pos=u+unk_neg=m")
-    system_baseline_safe = _build_baseline_system("classifier_pos=u_neg=m")
+    system_baseline_unsafe = _build_baseline_system(
+        "classifier_pos=u+unk_neg=m/model.pt", "classifier_all/model.pt"
+    )
+    system_baseline_safe = _build_baseline_system(
+        "classifier_pos=u_neg=m/model.pt", "classifier_all/model.pt"
+    )
+    system_baseline_gated_split = _build_baseline_system(
+        "classifier_unmarked/model.pt", "classifier_marked/model.pt"
+    )
     baseline_unsafe_system_metrics = evaluate_gated_system(
         system_baseline_unsafe, test_loader, device
     )
@@ -447,10 +493,16 @@ def main() -> None:
     baseline_safe_gate_metrics = evaluate_gate(
         system_baseline_safe.gate, test_loader, device
     )
+    baseline_gated_split_system_metrics = evaluate_gated_system(
+        system_baseline_gated_split, test_loader, device
+    )
+    baseline_gated_split_gate_metrics = evaluate_gate(
+        system_baseline_gated_split.gate, test_loader, device
+    )
 
-    comparison_df = build_comparison_dataframe(
+    plot_system_comparison(
+        epoch_eval_history,
         [
-            ("trained", system_metrics, gate_metrics),
             (
                 "unlearnt (unsafe)",
                 baseline_unsafe_system_metrics,
@@ -461,10 +513,13 @@ def main() -> None:
                 baseline_safe_system_metrics,
                 baseline_safe_gate_metrics,
             ),
-        ]
-    )
-    plot_system_comparison(
-        comparison_df, save_path=experiment_dir / "system_comparison.png"
+            (
+                "gated split",
+                baseline_gated_split_system_metrics,
+                baseline_gated_split_gate_metrics,
+            ),
+        ],
+        save_path=experiment_dir / "system_comparison.png",
     )
     print(f"Saved system comparison plot to {experiment_dir / 'system_comparison.png'}")
 

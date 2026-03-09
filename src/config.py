@@ -19,8 +19,8 @@ class Config:
     system_init_gate_path: str | None = (
         None  # None = non-trained gate; else load from path
     )
-    system_init_safe_model: str = "classifier_pos=u_neg=m"
-    system_init_unsafe_model: str = "classifier_all"
+    system_init_safe_model: str = "classifier_pos=u_neg=m/model.pt"
+    system_init_unsafe_model: str = "classifier_all/model.pt"
 
     # System training (gate + safe model)
     system_epochs: int = 2

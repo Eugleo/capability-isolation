@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Literal
 
 import matplotlib.pyplot as plt
+import polars as pl
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -228,81 +229,99 @@ def plot_gate_history(
     plt.close(fig)
 
 
-def plot_system_comparison(
-    trained_system_metrics: dict[str, float],
-    trained_gate_metrics: dict[str, float],
-    baseline_system_metrics: dict[str, float],
-    baseline_gate_metrics: dict[str, float],
-    save_path: Path | str,
-) -> None:
-    """4-panel plot comparing trained vs baseline (unlearning) systems.
+def build_comparison_dataframe(
+    models: list[tuple[str, dict[str, float], dict[str, float]]],
+) -> pl.DataFrame:
+    """Build a long-format DataFrame from (model_name, system_metrics, gate_metrics) tuples.
 
+    Columns: model, metric, value.
+    """
+    rows: list[dict[str, str | float]] = []
+    for name, sys_m, gate_m in models:
+        merged = {**sys_m, **gate_m}
+        for k, v in merged.items():
+            metric = k.removeprefix("@/")
+            val = 0.0 if v is None or (isinstance(v, float) and math.isnan(v)) else v
+            rows.append({"model": name, "metric": metric, "value": val})
+    return pl.DataFrame(rows)
+
+
+def plot_system_comparison(df: pl.DataFrame, save_path: Path | str) -> None:
+    """4-panel plot comparing models from a metrics DataFrame.
+
+    Expects columns: model, metric, value.
     Panels: (1) system overall, (2) safe_only on unmarked, (3) safe_only on marked,
     (4) gate precision vs recall.
     """
     fig, axes = plt.subplots(2, 2, figsize=(10, 10))
 
-    def _m(d: dict[str, float], key: str) -> float:
-        v = d.get(key)
-        if v is None:
-            v = d.get(f"@/{key}")
-        if v is None or (isinstance(v, float) and math.isnan(v)):
-            return 0.0
-        return v
+    names = df["model"].unique().to_list()
+    n = len(names)
+    color_map = {
+        "trained": "#377eb8",
+        "unlearnt (unsafe)": "#e41a1c",
+        "unlearnt (safe)": "#4daf4a",
+    }
+    colors = [color_map.get(n, "#888888") for n in names]
+    x_pos = list(range(n))
+    width = max(0.25, 0.8 / n)
 
-    names = ["trained", "baseline (unlearning)"]
-    colors = ["#377eb8", "#e41a1c"]
-    x_pos = [0, 1]
-    width = 0.35
+    def _vals(metric: str) -> list[float]:
+        sub = df.filter(pl.col("metric") == metric)
+        lookup = dict(zip(sub["model"].to_list(), sub["value"].to_list()))
+        return [lookup.get(m, 0.0) for m in names]
 
     # Panel 1: Overall system performance
     ax = axes[0, 0]
-    vals = [
-        _m(trained_system_metrics, "system/all/accuracy"),
-        _m(baseline_system_metrics, "system/all/accuracy"),
-    ]
-    ax.bar(x_pos, vals, width=width, color=colors, tick_label=names)
+    ax.bar(
+        x_pos, _vals("system/all/accuracy"), width=width, color=colors, tick_label=names
+    )
     ax.set_ylabel("Accuracy")
     ax.set_title("System overall")
     ax.set_ylim(0, 1)
 
     # Panel 2: Safe-only on unmarked
     ax = axes[0, 1]
-    vals = [
-        _m(trained_system_metrics, "safe_only/unmarked/accuracy"),
-        _m(baseline_system_metrics, "safe_only/unmarked/accuracy"),
-    ]
-    ax.bar(x_pos, vals, width=width, color=colors, tick_label=names)
+    ax.bar(
+        x_pos,
+        _vals("safe_only/unmarked/accuracy"),
+        width=width,
+        color=colors,
+        tick_label=names,
+    )
     ax.set_ylabel("Accuracy")
     ax.set_title("Safe-only on unmarked")
     ax.set_ylim(0, 1)
 
     # Panel 3: Safe-only on marked
     ax = axes[1, 0]
-    vals = [
-        _m(trained_system_metrics, "safe_only/marked/accuracy"),
-        _m(baseline_system_metrics, "safe_only/marked/accuracy"),
-    ]
-    ax.bar(x_pos, vals, width=width, color=colors, tick_label=names)
+    ax.bar(
+        x_pos,
+        _vals("safe_only/marked/accuracy"),
+        width=width,
+        color=colors,
+        tick_label=names,
+    )
     ax.set_ylabel("Accuracy")
     ax.set_title("Safe-only on marked")
     ax.set_ylim(0, 1)
 
     # Panel 4: Gate precision (y) vs recall (x)
     ax = axes[1, 1]
-    recall_t = _m(trained_gate_metrics, "gate/marked/recall")
-    prec_t = _m(trained_gate_metrics, "gate/marked/precision")
-    recall_b = _m(baseline_gate_metrics, "gate/marked/recall")
-    prec_b = _m(baseline_gate_metrics, "gate/marked/precision")
-    ax.scatter(recall_t, prec_t, label="trained", s=100, color=colors[0], zorder=5)
-    ax.scatter(
-        recall_b,
-        prec_b,
-        label="baseline (unlearning)",
-        s=100,
-        color=colors[1],
-        zorder=5,
-    )
+    recall_df = df.filter(pl.col("metric") == "gate/marked/recall")
+    prec_df = df.filter(pl.col("metric") == "gate/marked/precision")
+    for i, name in enumerate(names):
+        recall = recall_df.filter(pl.col("model") == name)["value"]
+        prec = prec_df.filter(pl.col("model") == name)["value"]
+        if len(recall) > 0 and len(prec) > 0:
+            ax.scatter(
+                recall[0],
+                prec[0],
+                label=name,
+                s=100,
+                color=colors[i],
+                zorder=5,
+            )
     ax.set_xlabel("Gate recall")
     ax.set_ylabel("Gate precision")
     ax.set_title("Gate precision vs recall")
@@ -328,7 +347,9 @@ def _create_experiment_dir() -> Path:
 
 
 def main() -> None:
-    config = Config()
+    config = Config(
+        system_init_safe_model="classifier_unlearnt_safe.pt",
+    )
     set_seed(config.seed)
     device = get_device()
     print(f"Using device: {device}")
@@ -401,47 +422,69 @@ def main() -> None:
     for key, value in system_metrics.items():
         print(f"  {key}: {format_metric_value(key, value)}")
 
-    # Build baseline system (unlearning) for comparison plot
-    gate_baseline = Gate().to(device)
-    gate_baseline.load_state_dict(
-        torch.load(
-            checkpoint_dir / "gate_known.pt",
-            map_location=device,
-            weights_only=True,
-        )["model_state_dict"]
-    )
-    model_safe_baseline = Classifier().to(device)
-    model_safe_baseline.load_state_dict(
-        torch.load(
-            checkpoint_dir / "classifier_unlearnt_unsafe.pt",
-            map_location=device,
-            weights_only=True,
-        )["model_state_dict"]
-    )
-    model_unsafe_baseline = Classifier().to(device)
-    model_unsafe_baseline.load_state_dict(
-        torch.load(
-            checkpoint_dir / "classifier_all.pt",
-            map_location=device,
-            weights_only=True,
-        )["model_state_dict"]
-    )
-    system_baseline = GatedSystem(
-        gate=gate_baseline,
-        model_safe=model_safe_baseline,
-        model_unsafe=model_unsafe_baseline,
-    )
-    baseline_system_metrics = evaluate_gated_system(
-        system_baseline, test_loader, device
-    )
-    baseline_gate_metrics = evaluate_gate(system_baseline.gate, test_loader, device)
+    def _build_baseline_system(safe_model_path: str) -> GatedSystem:
+        gate_bl = Gate().to(device)
+        gate_bl.load_state_dict(
+            torch.load(
+                checkpoint_dir / "gate_known.pt",
+                map_location=device,
+                weights_only=True,
+            )["model_state_dict"]
+        )
+        model_safe_bl = Classifier().to(device)
+        model_safe_bl.load_state_dict(
+            torch.load(
+                checkpoint_dir / safe_model_path,
+                map_location=device,
+                weights_only=True,
+            )["model_state_dict"]
+        )
+        model_unsafe_bl = Classifier().to(device)
+        model_unsafe_bl.load_state_dict(
+            torch.load(
+                checkpoint_dir / "classifier_all.pt",
+                map_location=device,
+                weights_only=True,
+            )["model_state_dict"]
+        )
+        return GatedSystem(
+            gate=gate_bl,
+            model_safe=model_safe_bl,
+            model_unsafe=model_unsafe_bl,
+        )
 
+    system_baseline_unsafe = _build_baseline_system("classifier_unlearnt_unsafe.pt")
+    system_baseline_safe = _build_baseline_system("classifier_unlearnt_safe.pt")
+    baseline_unsafe_system_metrics = evaluate_gated_system(
+        system_baseline_unsafe, test_loader, device
+    )
+    baseline_unsafe_gate_metrics = evaluate_gate(
+        system_baseline_unsafe.gate, test_loader, device
+    )
+    baseline_safe_system_metrics = evaluate_gated_system(
+        system_baseline_safe, test_loader, device
+    )
+    baseline_safe_gate_metrics = evaluate_gate(
+        system_baseline_safe.gate, test_loader, device
+    )
+
+    comparison_df = build_comparison_dataframe(
+        [
+            ("trained", system_metrics, gate_metrics),
+            (
+                "unlearnt (unsafe)",
+                baseline_unsafe_system_metrics,
+                baseline_unsafe_gate_metrics,
+            ),
+            (
+                "unlearnt (safe)",
+                baseline_safe_system_metrics,
+                baseline_safe_gate_metrics,
+            ),
+        ]
+    )
     plot_system_comparison(
-        trained_system_metrics=system_metrics,
-        trained_gate_metrics=gate_metrics,
-        baseline_system_metrics=baseline_system_metrics,
-        baseline_gate_metrics=baseline_gate_metrics,
-        save_path=experiment_dir / "system_comparison.png",
+        comparison_df, save_path=experiment_dir / "system_comparison.png"
     )
     print(f"Saved system comparison plot to {experiment_dir / 'system_comparison.png'}")
 

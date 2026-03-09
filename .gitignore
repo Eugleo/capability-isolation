@@ -12,3 +12,4 @@ wheels/
 # Checkpoints and data
 checkpoints/
 data/
+experiments/

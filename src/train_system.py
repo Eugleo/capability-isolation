@@ -128,8 +128,21 @@ def train_system(
     test_loader: DataLoader,
     system: GatedSystem,
 ) -> tuple[GatedSystem, list[dict[str, float]], list[dict[str, float]]]:
-    # Only train gate and safe model
-    params = list(system.gate.parameters()) + list(system.model_safe.parameters())
+    trainable = set(config.system_trainable)
+    for p in system.gate.parameters():
+        p.requires_grad = "gate" in trainable
+    for p in system.model_safe.parameters():
+        p.requires_grad = "safe" in trainable
+    for p in system.model_unsafe.parameters():
+        p.requires_grad = "unsafe" in trainable
+
+    params: list[nn.Parameter] = []
+    if "gate" in trainable:
+        params.extend(system.gate.parameters())
+    if "safe" in trainable:
+        params.extend(system.model_safe.parameters())
+    if "unsafe" in trainable:
+        params.extend(system.model_unsafe.parameters())
     optimizer = optim.Adam(params, lr=config.system_lr)
 
     w_cls = config.system_classification_weight
@@ -386,6 +399,8 @@ def _create_experiment_dir() -> Path:
 def main() -> None:
     config = Config(
         system_epochs=10,
+        system_trainable=("gate", "safe"),
+        system_init_gate_path="gate_known.pt",
         system_init_safe_model="classifier_all/model.pt",
         system_init_unsafe_model="classifier_all/model.pt",
     )
@@ -425,10 +440,6 @@ def main() -> None:
     model_unsafe = Classifier.load(
         checkpoint_dir / config.system_init_unsafe_model, device=device
     )
-
-    # Freeze unsafe model
-    for p in model_unsafe.parameters():
-        p.requires_grad = False
 
     system = GatedSystem(gate=gate, model_safe=model_safe, model_unsafe=model_unsafe)
 

@@ -23,6 +23,7 @@ class Config:
     system_init_unsafe_model: str = "classifier_all/model.pt"
 
     # System training (gate + safe model)
+    system_trainable: tuple[str, ...] = ("gate", "safe", "unsafe")
     system_epochs: int = 2
     system_lr: float = 1e-4
     system_classification_weight: float = 1.0

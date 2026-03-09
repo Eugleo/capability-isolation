@@ -1,3 +1,6 @@
+from pathlib import Path
+from typing import Optional
+
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -28,6 +31,45 @@ class Classifier(nn.Module):
         for group in self.groups:
             x = group(x)
         return x
+
+    def save(self, path: Path | str) -> None:
+        """Save the classifier state dict to a checkpoint file."""
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save({"model_state_dict": self.state_dict()}, path)
+
+    @classmethod
+    def load(
+        cls,
+        path: Path | str,
+        *,
+        device: Optional[torch.device] = None,
+    ) -> "Classifier":
+        """Load a Classifier from a checkpoint file or directory.
+
+        If path is a directory, loads from path/model.pt.
+        If path is a file, loads directly.
+        If path is a .pt file that does not exist, tries path.parent/path.stem/model.pt
+        (e.g. classifier_all.pt -> classifier_all/model.pt).
+        """
+        path = Path(path)
+        if path.is_dir():
+            load_path = path / "model.pt"
+        elif path.suffix == ".pt" and not path.exists():
+            dir_path = path.parent / path.stem
+            if dir_path.exists():
+                load_path = dir_path / "model.pt"
+            else:
+                load_path = path
+        else:
+            load_path = path
+        map_location = device if device is not None else "cpu"
+        data = torch.load(load_path, map_location=map_location, weights_only=True)
+        model = cls()
+        model.load_state_dict(data["model_state_dict"])
+        if device is not None:
+            model = model.to(device)
+        return model
 
 
 def evaluate_classifier(

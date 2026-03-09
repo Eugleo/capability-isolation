@@ -184,6 +184,8 @@ def plot_classifier_evaluation(
                 label=model_name,
                 color=colors.get(model_name, "#888888"),
                 alpha=alpha,
+                marker="o",
+                markersize=4,
             )
             if single_legend and model_name not in legend_handles:
                 legend_handles[model_name] = line

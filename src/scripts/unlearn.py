@@ -2,6 +2,9 @@ import json
 from dataclasses import asdict
 from pathlib import Path
 
+import matplotlib.pyplot as plt
+import numpy as np
+import polars as pl
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -10,12 +13,20 @@ from torch.utils.data import DataLoader, Subset
 from src.classifier import Classifier, evaluate_classifier
 from src.config import Config
 from src.data import MarkedMNIST
-from src.train_classifier import build_eval_dataframe, plot_classifier_evaluation
+from src.train_classifier import build_eval_dataframe
 from src.utils import format_metric_value, get_device, set_seed
 
 # Weights for the two extra losses (maximize marked loss, maximize L2 divergence)
 WEIGHT_MARKED_LOSS = 5e-5
 WEIGHT_DIVERGENCE = 0.0
+KEEP_ORDER = ["m", "m+unk", "u", "u+unk"]
+DATA_TYPE_ORDER = ["unmarked", "marked-left", "marked-right"]
+FORGET_COLORS = {
+    "m": "#ff7f00",
+    "m+unk": "#a65628",
+    "u": "#999999",
+    "u+unk": "#f781bf",
+}
 
 
 def l2_weight_divergence(model: nn.Module, frozen: nn.Module) -> torch.Tensor:
@@ -23,6 +34,112 @@ def l2_weight_divergence(model: nn.Module, frozen: nn.Module) -> torch.Tensor:
     for p, p_frozen in zip(model.parameters(), frozen.parameters()):
         total = total + ((p - p_frozen) ** 2).sum()
     return total
+
+
+def parse_unlearn_model_name(model_name: str) -> tuple[str, str] | None:
+    prefix = "classifier_pos="
+    separator = "_neg="
+    if not model_name.startswith(prefix) or separator not in model_name:
+        return None
+    model_spec = model_name.removeprefix(prefix)
+    keep_label, forget_label = model_spec.split(separator, maxsplit=1)
+    return keep_label, forget_label
+
+
+def plot_unlearn_evaluation(
+    df: pl.DataFrame,
+    save_path: Path | str,
+    *,
+    jitter: float = 0.03,
+    alpha: float = 1.0,
+) -> None:
+    """Plot unlearning results as a 4x3 grid grouped by kept capability."""
+    if df.is_empty():
+        return
+
+    parsed_rows: list[dict[str, str | float]] = []
+    for row in df.iter_rows(named=True):
+        parsed = parse_unlearn_model_name(str(row["model"]))
+        if parsed is None:
+            continue
+        keep_label, forget_label = parsed
+        parsed_rows.append(
+            {
+                "model": str(row["model"]),
+                "epoch": float(row["epoch"]),
+                "data_type": str(row["data_type"]),
+                "accuracy": float(row["accuracy"]),
+                "keep_label": keep_label,
+                "forget_label": forget_label,
+            }
+        )
+
+    if not parsed_rows:
+        return
+
+    plot_df = pl.DataFrame(parsed_rows)
+    fig, axes = plt.subplots(
+        len(KEEP_ORDER),
+        len(DATA_TYPE_ORDER),
+        figsize=(14, 12),
+        sharex=True,
+        sharey=True,
+    )
+    rng = np.random.default_rng(42)
+
+    for row_idx, keep_label in enumerate(KEEP_ORDER):
+        row_handles: dict[str, plt.Line2D] = {}
+        for col_idx, data_type in enumerate(DATA_TYPE_ORDER):
+            ax = axes[row_idx, col_idx]
+            panel_df = plot_df.filter(
+                (pl.col("keep_label") == keep_label)
+                & (pl.col("data_type") == data_type)
+            )
+            if panel_df.is_empty():
+                ax.set_title(data_type)
+                ax.grid(True, alpha=0.3)
+                continue
+
+            forget_labels = panel_df["forget_label"].unique().sort().to_list()
+            for forget_label in forget_labels:
+                model_df = panel_df.filter(pl.col("forget_label") == forget_label).sort(
+                    "epoch"
+                )
+                epochs = np.array(model_df["epoch"].to_list())
+                accuracies = np.array(model_df["accuracy"].to_list())
+                if jitter > 0:
+                    epochs = epochs + rng.uniform(-jitter, jitter, size=len(epochs))
+                (line,) = ax.plot(
+                    epochs,
+                    accuracies,
+                    color=FORGET_COLORS.get(forget_label, "#888888"),
+                    alpha=alpha,
+                    marker="o",
+                    markersize=4,
+                    label=f"forget {forget_label}",
+                )
+                row_handles.setdefault(f"forget {forget_label}", line)
+
+            ax.set_title(data_type)
+            ax.set_ylim(0, 1)
+            ax.grid(True, alpha=0.3)
+            if row_idx == len(KEEP_ORDER) - 1:
+                ax.set_xlabel("Epoch")
+            if col_idx == 0:
+                ax.set_ylabel(f"Keep {keep_label}\nAccuracy")
+
+        if row_handles:
+            axes[row_idx, 0].legend(
+                row_handles.values(),
+                row_handles.keys(),
+                loc="lower right",
+                fontsize=8,
+                title=f"keep {keep_label}",
+            )
+
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
 
 
 def train_entanglement_unlearn(
@@ -172,6 +289,20 @@ def main() -> None:
     for k, v in evaluate_classifier(base_model, test_loader, device).items():
         print(f"  {k}: {format_metric_value(k, v)}")
 
+    metrics_csv_path = checkpoint_dir / "classifier_unlearn_metrics.csv"
+    if metrics_csv_path.exists():
+        print(f"\nLoading per-epoch metrics from {metrics_csv_path}")
+        plot_unlearn_evaluation(
+            pl.read_csv(metrics_csv_path),
+            checkpoint_dir / "classifier_unlearn_evaluation.png",
+            jitter=0.03,
+            alpha=1.0,
+        )
+        print(
+            f"\nSaved evaluation plot to {checkpoint_dir / 'classifier_unlearn_evaluation.png'}"
+        )
+        return
+
     model_histories: dict[str, list[dict[str, float]]] = {}
 
     def _run_unlearn(
@@ -182,47 +313,44 @@ def main() -> None:
     ) -> None:
         save_dir = checkpoint_dir / name
         model_path = save_dir / "model.pt"
+        model = Classifier().to(device)
+        model.load_state_dict(base_model.state_dict())
+        frozen = Classifier().to(device)
+        frozen.load_state_dict(base_model.state_dict())
+        frozen.eval()
+        for p in frozen.parameters():
+            p.requires_grad_(False)
 
-        if model_path.exists():
-            print("\n" + "=" * 60)
-            print(f"Loading {name} from cache")
-            print("=" * 60)
-            model = Classifier.load(model_path, device=device)
-        else:
-            model = Classifier().to(device)
-            model.load_state_dict(base_model.state_dict())
-            frozen = Classifier().to(device)
-            frozen.load_state_dict(base_model.state_dict())
-            frozen.eval()
-            for p in frozen.parameters():
-                p.requires_grad_(False)
+        print("\n" + "=" * 60)
+        print(f"Training {name} (positive={positive}, negative={negative})")
+        print("=" * 60)
+        model, history = train_entanglement_unlearn(
+            model,
+            frozen,
+            train_loader,
+            test_loader,
+            device,
+            epochs=config.classifier_epochs,
+            lr=config.classifier_lr,
+            positive_kind_labels=positive,
+            negative_kind_labels=negative,
+        )
 
-            print("\n" + "=" * 60)
-            print(f"Training {name} (positive={positive}, negative={negative})")
-            print("=" * 60)
-            model, _ = train_entanglement_unlearn(
-                model,
-                frozen,
-                train_loader,
-                test_loader,
-                device,
-                epochs=config.classifier_epochs,
-                lr=config.classifier_lr,
-                positive_kind_labels=positive,
-                negative_kind_labels=negative,
-            )
+        save_dir.mkdir(parents=True, exist_ok=True)
+        model.save(model_path)
+        with open(save_dir / "config.json", "w") as f:
+            json.dump(asdict(config), f, indent=2)
+        print(f"Saved to {model_path}")
 
-            save_dir.mkdir(parents=True, exist_ok=True)
-            model.save(model_path)
-            with open(save_dir / "config.json", "w") as f:
-                json.dump(asdict(config), f, indent=2)
-            print(f"Saved to {model_path}")
-
-        metrics = evaluate_classifier(model, test_loader, device)
+        metrics = (
+            history[-1] if history else evaluate_classifier(model, test_loader, device)
+        )
         print(f"{name} evaluation:")
         for k, v in metrics.items():
+            if k == "epoch":
+                continue
             print(f"  {k}: {format_metric_value(k, v)}")
-        model_histories[name] = [{"epoch": 1.0, **metrics}]
+        model_histories[name] = history
 
     # Keep unmarked variants, remove marked variants (u=unmarked, m=marked, unk=unknown)
     _run_unlearn(
@@ -273,14 +401,14 @@ def main() -> None:
     # Evaluation plot
     if model_histories:
         eval_df = build_eval_dataframe(model_histories)
-        plot_classifier_evaluation(
-            eval_df,
+        eval_df.write_csv(metrics_csv_path)
+        plot_unlearn_evaluation(
+            pl.read_csv(metrics_csv_path),
             checkpoint_dir / "classifier_unlearn_evaluation.png",
-            single_legend=True,
             jitter=0.03,
-            alpha=0.5,
-            use_palette=True,
+            alpha=1.0,
         )
+        print(f"\nSaved per-epoch metrics CSV to {metrics_csv_path}")
         print(
             f"\nSaved evaluation plot to {checkpoint_dir / 'classifier_unlearn_evaluation.png'}"
         )

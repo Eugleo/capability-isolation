@@ -69,7 +69,7 @@ class GatedSystem(nn.Module):
         kind_labels: Optional[
             list[Literal["unknown", "unmarked", "left", "right"]]
         ] = None,
-        is_unsafe_allowed: bool = True,
+        force_gate: Optional[Literal[0, 1]] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         logits_safe_BC = self.model_safe(images_BCHW)
         logits_unsafe_BC = self.model_unsafe(images_BCHW)
@@ -98,8 +98,8 @@ class GatedSystem(nn.Module):
             # Eval mode: threshold at 0.5
             gate_used_B1 = (gate_computed_B1 > 0.5).to(images_BCHW.dtype)
 
-        if not is_unsafe_allowed:
-            gate_used_B1 = torch.zeros_like(gate_used_B1)
+        if force_gate is not None:
+            gate_used_B1 = torch.full_like(gate_used_B1, float(force_gate))
 
         probs_BC = (1 - gate_used_B1) * probs_safe_BC + gate_used_B1 * probs_unsafe_BC
 
@@ -129,7 +129,8 @@ def evaluate_gated_system(
         "marked/unknown/left": (0.0, 0.0),
         "marked/unknown/right": (0.0, 0.0),
     }
-    safe_only_counts = {k: (0.0, 0.0) for k in counts}
+    system_safe_counts = {k: (0.0, 0.0) for k in counts}
+    system_unsafe_counts = {k: (0.0, 0.0) for k in counts}
 
     with torch.no_grad():
         for batch in dataset:
@@ -137,12 +138,15 @@ def evaluate_gated_system(
             images_BCHW = images_BCHW.to(device)
             labels_B = labels_B.to(device)
 
-            probs_BC, _, _ = system(images_BCHW, is_unsafe_allowed=True)
-            probs_safe_only_BC, _, _ = system(images_BCHW, is_unsafe_allowed=False)
+            probs_BC, _, _ = system(images_BCHW, force_gate=None)
+            probs_safe_BC, _, _ = system(images_BCHW, force_gate=0)
+            probs_unsafe_BC, _, _ = system(images_BCHW, force_gate=1)
             pred_B = probs_BC.argmax(dim=-1)
-            pred_safe_only_B = probs_safe_only_BC.argmax(dim=-1)
+            pred_safe_B = probs_safe_BC.argmax(dim=-1)
+            pred_unsafe_B = probs_unsafe_BC.argmax(dim=-1)
             correct_B = (pred_B == labels_B).float()
-            correct_safe_only_B = (pred_safe_only_B == labels_B).float()
+            correct_safe_B = (pred_safe_B == labels_B).float()
+            correct_unsafe_B = (pred_unsafe_B == labels_B).float()
 
             is_unmarked_B = torch.tensor(
                 [k == "unmarked" for k in kinds], device=device
@@ -220,17 +224,21 @@ def evaluate_gated_system(
             ]
 
             _update(counts, correct_B, masks_all)
-            _update(safe_only_counts, correct_safe_only_B, masks_all)
+            _update(system_safe_counts, correct_safe_B, masks_all)
+            _update(system_unsafe_counts, correct_unsafe_B, masks_all)
 
-    priority_metrics = ["system/all", "safe_only/unmarked", "safe_only/marked"]
+    priority_metrics = ["system/all", "system_safe/unmarked", "system_safe/marked"]
 
     all_metrics: dict[str, float] = {}
     for name in counts:
         c, t = counts[name]
         all_metrics[f"system/{name}/accuracy"] = _acc(c, t)
-    for name in safe_only_counts:
-        c, t = safe_only_counts[name]
-        all_metrics[f"safe_only/{name}/accuracy"] = _acc(c, t)
+    for name in system_safe_counts:
+        c, t = system_safe_counts[name]
+        all_metrics[f"system_safe/{name}/accuracy"] = _acc(c, t)
+    for name in system_unsafe_counts:
+        c, t = system_unsafe_counts[name]
+        all_metrics[f"system_unsafe/{name}/accuracy"] = _acc(c, t)
 
     result: dict[str, float] = {}
     for base in priority_metrics:
@@ -239,47 +247,3 @@ def evaluate_gated_system(
             result[f"@/{key}"] = all_metrics.pop(key)
     result.update(all_metrics)
     return result
-
-
-def main() -> None:
-    config = Config()
-    set_seed(config.seed)
-    device = get_device()
-    print(f"Using device: {device}")
-
-    checkpoint_dir = Path(config.checkpoint_dir)
-    system_path = checkpoint_dir / "system.pt"
-    if system_path.exists():
-        system = GatedSystem.load(system_path, device=device)
-    else:
-        gate = Gate().to(device)
-        gate.load_state_dict(
-            torch.load(
-                checkpoint_dir / "gate_known.pt",
-                map_location=device,
-                weights_only=True,
-            )["model_state_dict"]
-        )
-        model_safe = Classifier.load(checkpoint_dir / "classifier_pos=u_neg=m", device=device)
-        model_unsafe = Classifier.load(checkpoint_dir / "classifier_all", device=device)
-        system = GatedSystem(
-            gate=gate, model_safe=model_safe, model_unsafe=model_unsafe
-        )
-
-    _, test_loader = get_dataloaders(
-        known_kind_fraction=config.known_kind_fraction,
-        unknown_kind_fraction=config.unknown_kind_fraction,
-        seed=config.seed,
-        batch_size=config.classifier_batch_size,
-    )
-
-    print("\n" + "=" * 60)
-    print("GatedSystem evaluation")
-    print("=" * 60)
-    metrics = evaluate_gated_system(system, test_loader, device)
-    for key, value in metrics.items():
-        print(f"  {key}: {format_metric_value(key, value)}")
-
-
-if __name__ == "__main__":
-    main()

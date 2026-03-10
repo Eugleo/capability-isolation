@@ -59,6 +59,7 @@ def divergence_loss(model_safe: nn.Module, model_unsafe: nn.Module) -> torch.Ten
     param_diffs = []
     for p_safe, p_unsafe in zip(model_safe.parameters(), model_unsafe.parameters()):
         diff = (p_safe - p_unsafe.detach()).flatten()
+        # diff = (p_safe - p_unsafe).flatten()
         param_diffs.append(diff)
 
     if len(param_diffs) == 0:
@@ -152,6 +153,24 @@ def train_system(
     gate_history: list[dict[str, float]] = []
     epoch_eval_history: list[dict[str, float]] = []
     step = 0
+
+    # Evaluate before first epoch
+    gate_metrics = evaluate_gate(system.gate, test_loader, device)
+    system_metrics = evaluate_gated_system(system, test_loader, device)
+    gate_str = "".join(
+        f"\n  {k}: {format_metric_value(k, v)}" for k, v in gate_metrics.items()
+    )
+    system_str = "".join(
+        f"\n  {k}: {format_metric_value(k, v)}" for k, v in system_metrics.items()
+    )
+    print(f"Before epoch 1 - Init\n  Gate:{gate_str}\n  System:{system_str}")
+    epoch_eval_history.append(
+        {
+            "epoch": 0.0,
+            "loss": math.nan,
+            **_merge_metrics(system_metrics, gate_metrics),
+        }
+    )
 
     for epoch in range(config.system_epochs):
         system.train()
@@ -385,7 +404,7 @@ def main() -> None:
     config = Config(
         system_lr=3e-4,
         system_epochs=15,
-        system_trainable=("gate", "safe", "unsafe"),
+        system_trainable=("gate", "safe"),
         system_init_gate_path="gate_known.pt",
         system_init_safe_model="classifier_all/model.pt",
         system_init_unsafe_model="classifier_all/model.pt",

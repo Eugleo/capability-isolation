@@ -72,17 +72,17 @@ def main() -> None:
     checkpoint_dir = Path(config.checkpoint_dir)
 
     train_dataset = MarkedMNIST(
-        known_kind_fraction=config.known_kind_fraction,
-        unknown_kind_fraction=config.unknown_kind_fraction,
+        kind_fraction=config.kind_fraction,
         seed=config.seed,
         train=True,
     )
     test_dataset = MarkedMNIST(
-        known_kind_fraction=config.known_kind_fraction,
-        unknown_kind_fraction=config.unknown_kind_fraction,
+        kind_fraction=config.kind_fraction,
         seed=config.seed + 1,
         train=False,
     )
+    train_dataset.print_summary("Train dataset")
+    test_dataset.print_summary("Test dataset")
 
     known_indices = [
         i

@@ -223,23 +223,21 @@ def main() -> None:
     checkpoint_dir = Path(config.checkpoint_dir)
 
     train_loader, test_loader = get_dataloaders(
-        known_kind_fraction=config.known_kind_fraction,
-        unknown_kind_fraction=config.unknown_kind_fraction,
+        kind_fraction=config.kind_fraction,
         seed=config.seed,
         batch_size=config.classifier_batch_size,
+        describe_datasets=True,
     )
 
     train_marked, _ = get_filtered_dataloaders(
-        known_kind_fraction=config.known_kind_fraction,
-        unknown_kind_fraction=config.unknown_kind_fraction,
+        kind_fraction=config.kind_fraction,
         seed=config.seed,
         batch_size=config.classifier_batch_size,
         filter_kinds=("left", "right"),
     )
 
     train_unmarked, _ = get_filtered_dataloaders(
-        known_kind_fraction=config.known_kind_fraction,
-        unknown_kind_fraction=config.unknown_kind_fraction,
+        kind_fraction=config.kind_fraction,
         seed=config.seed,
         batch_size=config.classifier_batch_size,
         filter_kinds=("unmarked",),

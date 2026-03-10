@@ -3,9 +3,8 @@ from dataclasses import dataclass
 
 @dataclass
 class Config:
-    # Data marking: (unmarked, left, right) proportions
-    known_kind_fraction: tuple[float, float] = (0.5, 0.0)
-    unknown_kind_fraction: tuple[float, float] = (0.0, 0.5)
+    # Data marking: (left, right) probabilities; remaining mass is unmarked.
+    kind_fraction: tuple[float, float] = (0.33, 0.33)
 
     # Paths
     checkpoint_dir: str = "checkpoints"

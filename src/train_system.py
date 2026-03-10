@@ -423,10 +423,10 @@ def main() -> None:
     checkpoint_dir = Path(config.checkpoint_dir)
 
     train_loader, test_loader = get_dataloaders(
-        known_kind_fraction=config.known_kind_fraction,
-        unknown_kind_fraction=config.unknown_kind_fraction,
+        kind_fraction=config.kind_fraction,
         seed=config.seed,
         batch_size=config.classifier_batch_size,
+        describe_datasets=True,
     )
 
     # Load pretrained components

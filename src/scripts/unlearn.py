@@ -16,7 +16,7 @@ from src.data import MarkedMNIST
 from src.train_classifier import build_eval_dataframe
 from src.utils import format_metric_value, get_device, set_seed
 
-# Weights for the two extra losses (maximize marked loss, maximize L2 divergence)
+# Weights for the two extra losses (maximize right/left-marked loss, maximize L2 divergence)
 WEIGHT_MARKED_LOSS = 5e-5
 WEIGHT_DIVERGENCE = 0.0
 KEEP_ORDER = ["m", "m+unk", "u", "u+unk"]
@@ -241,16 +241,16 @@ def main() -> None:
     # Load dataset
     train_dataset = MarkedMNIST(
         train=True,
-        known_kind_fraction=config.known_kind_fraction,
-        unknown_kind_fraction=config.unknown_kind_fraction,
+        kind_fraction=config.kind_fraction,
         seed=config.seed,
     )
     test_dataset = MarkedMNIST(
         train=False,
-        known_kind_fraction=config.known_kind_fraction,
-        unknown_kind_fraction=config.unknown_kind_fraction,
+        kind_fraction=config.kind_fraction,
         seed=config.seed + 1,
     )
+    train_dataset.print_summary("Train dataset")
+    test_dataset.print_summary("Test dataset")
 
     # Train loaders for experiments
     known_train_indices = [

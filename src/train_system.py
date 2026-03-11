@@ -547,16 +547,20 @@ def main() -> None:
         config, device, train_loader, test_loader, system
     )
 
-    batch_metrics_df.write_csv(experiment_dir / "batch_kind_metrics.csv")
-    print(f"Saved batch metrics to {experiment_dir / 'batch_kind_metrics.csv'}")
+    batch_metrics_df.write_csv(experiment_dir / "batch_metrics.csv")
+    print(f"Saved batch metrics to {experiment_dir / 'batch_metrics.csv'}")
 
-    plot_batch_kind_metrics(batch_metrics_df, experiment_dir / "batch_kind_metrics.png")
+    plot_batch_kind_metrics(
+        batch_metrics_df, experiment_dir / "batch_metrics_per_kind.png"
+    )
     print(
-        f"Saved batch kind metrics plot to {experiment_dir / 'batch_kind_metrics.png'}"
+        f"Saved batch per-kind metrics plot to {experiment_dir / 'batch_metrics_per_kind.png'}"
     )
 
-    plot_batch_kind_diffs(batch_metrics_df, experiment_dir / "batch_kind_diffs.png")
-    print(f"Saved batch kind diffs plot to {experiment_dir / 'batch_kind_diffs.png'}")
+    plot_batch_kind_diffs(batch_metrics_df, experiment_dir / "batch_diffs_per_kind.png")
+    print(
+        f"Saved batch per-kind diffs plot to {experiment_dir / 'batch_diffs_per_kind.png'}"
+    )
 
     gate_metrics = evaluate_gate(system.gate, test_loader, device)
     system_metrics = evaluate_gated_system(system, test_loader, device)
@@ -569,15 +573,15 @@ def main() -> None:
 
     plot_aggregate_metrics(
         epoch_eval_history,
-        save_path=experiment_dir / "aggregate_metrics.png",
+        save_path=experiment_dir / "eval_aggregate.png",
     )
-    print(f"Saved aggregate metrics plot to {experiment_dir / 'aggregate_metrics.png'}")
+    print(f"Saved aggregate accuracy plot to {experiment_dir / 'eval_aggregate.png'}")
 
     plot_kind_metrics(
         epoch_eval_history,
-        save_path=experiment_dir / "kind_metrics.png",
+        save_path=experiment_dir / "eval_per_kind.png",
     )
-    print(f"Saved kind metrics plot to {experiment_dir / 'kind_metrics.png'}")
+    print(f"Saved per-kind accuracy plot to {experiment_dir / 'eval_per_kind.png'}")
 
     system.save(
         experiment_dir / "system.pt",

@@ -3,6 +3,7 @@ import math
 import os
 from dataclasses import asdict
 from pathlib import Path
+from typing import get_args
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -14,8 +15,11 @@ from torch.utils.data import DataLoader
 
 from src.classifier import Classifier, evaluate_classifier
 from src.config import Config
-from src.data import get_dataloaders, get_filtered_dataloaders
+from src.data import Kind, get_dataloaders
 from src.utils import format_metric_value, get_device, set_seed
+
+PLOT_ITEM_KINDS = list(get_args(Kind))
+DISPLAY_METRIC_KEYS = [f"classifier/{item_kind}/accuracy" for item_kind in PLOT_ITEM_KINDS]
 
 
 def train_classifier(
@@ -39,9 +43,9 @@ def train_classifier(
         correct = 0
         total = 0
 
-        for images, labels, _, _ in train_loader:
-            images = images.to(device)
-            labels = labels.to(device)
+        for batch in train_loader:
+            images = batch["image"].to(device)
+            labels = batch["label"].to(device)
 
             optimizer.zero_grad()
             logits = model(images)
@@ -65,7 +69,9 @@ def train_classifier(
         history.append(epoch_entry)
 
         metric_str = "".join(
-            f"\n  {k}: {format_metric_value(k, v)}" for k, v in metrics.items()
+            f"\n  {key}: {format_metric_value(key, metrics[key])}"
+            for key in DISPLAY_METRIC_KEYS
+            if key in metrics
         )
         print(
             f"Epoch {epoch + 1}/{config.classifier_epochs} - Loss: {avg_loss:.4f}, "
@@ -75,34 +81,71 @@ def train_classifier(
     return model, history
 
 
-METRIC_KEYS = [
-    ("classifier/unmarked/accuracy", "unmarked"),
-    ("classifier/marked/left/accuracy", "marked-left"),
-    ("classifier/marked/right/accuracy", "marked-right"),
-]
+def _parse_classifier_metric_key(metric_key: str) -> tuple[str, str] | None:
+    parts = metric_key.split("/")
+    if len(parts) != 3 or parts[0] != "classifier":
+        return None
+    item_kind, metric_name = parts[1], parts[2]
+    if metric_name not in {"accuracy", "count"}:
+        return None
+    return item_kind, metric_name
+
+
+def _item_kind_metadata(item_kind: str) -> dict[str, str | bool | None]:
+    mark, size_name, knowledge_name = item_kind.split("-")
+    if mark == "*":
+        is_marked = None
+    elif mark == "none":
+        is_marked = False
+    else:
+        is_marked = True
+
+    if knowledge_name == "*":
+        is_known = None
+    else:
+        is_known = knowledge_name == "k"
+
+    return {
+        "item_kind": item_kind,
+        "mark": mark,
+        "size_name": size_name,
+        "knowledge_name": knowledge_name,
+        "is_marked": is_marked,
+        "is_known": is_known,
+    }
 
 
 def build_eval_dataframe(
     model_histories: dict[str, list[dict[str, float]]],
 ) -> pl.DataFrame:
-    """Build long-format DataFrame: model, epoch, data_type, accuracy."""
-    rows: list[dict[str, str | float]] = []
+    """Build per-epoch metrics DataFrame with parsed item-kind metadata."""
+    rows: list[dict[str, str | float | bool | None]] = []
     for model_name, history in model_histories.items():
         for entry in history:
             epoch = entry["epoch"]
-            for metric_key, data_type in METRIC_KEYS:
-                v = entry.get(metric_key, 0.0)
-                val = (
-                    0.0 if v is None or (isinstance(v, float) and math.isnan(v)) else v
-                )
-                rows.append(
+            metric_rows: dict[str, dict[str, str | float | bool | None]] = {}
+            for key, value in entry.items():
+                if key == "epoch":
+                    continue
+                parsed = _parse_classifier_metric_key(key)
+                if parsed is None:
+                    continue
+
+                item_kind, metric_name = parsed
+                row = metric_rows.setdefault(
+                    item_kind,
                     {
                         "model": model_name,
                         "epoch": epoch,
-                        "data_type": data_type,
-                        "accuracy": val,
-                    }
+                        **_item_kind_metadata(item_kind),
+                    },
                 )
+                if value is None or (isinstance(value, float) and math.isnan(value)):
+                    row[metric_name] = float("nan")
+                else:
+                    row[metric_name] = float(value)
+
+            rows.extend(metric_rows.values())
     return pl.DataFrame(rows)
 
 
@@ -131,15 +174,19 @@ def plot_classifier_evaluation(
     alpha: float = 1.0,
     use_palette: bool = False,
 ) -> None:
-    """3-panel plot: accuracy over epochs, one panel per data type."""
+    """6-panel plot: one panel per kind, with model comparison lines."""
     if df.is_empty():
         return
 
-    data_types = ["unmarked", "marked-left", "marked-right"]
+    plot_df = df.filter(pl.col("item_kind").is_in(PLOT_ITEM_KINDS))
+    if plot_df.is_empty():
+        return
+
     model_names = df["model"].unique().sort().to_list()
     n_models = len(model_names)
-    fig_h = max(5, 3 + n_models * 0.3)
-    fig, axes = plt.subplots(1, 3, figsize=(12, fig_h), sharey=True)
+    fig_h = max(7, 5 + n_models * 0.3)
+    fig, axes = plt.subplots(2, 3, figsize=(15, fig_h), sharex=True, sharey=True)
+    axes = np.asarray(axes).ravel()
 
     if use_palette:
         colors = {
@@ -165,10 +212,10 @@ def plot_classifier_evaluation(
     rng = np.random.default_rng(42)
     legend_handles: dict[str, plt.Line2D] = {}
 
-    for ax, data_type in zip(axes, data_types):
-        sub_df = df.filter(pl.col("data_type") == data_type)
+    for ax, item_kind in zip(axes, PLOT_ITEM_KINDS):
+        sub_df = plot_df.filter(pl.col("item_kind") == item_kind)
         if sub_df.is_empty():
-            ax.set_title(data_type)
+            ax.set_title(item_kind)
             continue
         for model_name in sub_df["model"].unique().to_list():
             model_sub = sub_df.filter(pl.col("model") == model_name).sort("epoch")
@@ -191,7 +238,7 @@ def plot_classifier_evaluation(
                 legend_handles[model_name] = line
         ax.set_xlabel("Epoch")
         ax.set_ylabel("Accuracy")
-        ax.set_title(data_type)
+        ax.set_title(item_kind)
         ax.set_ylim(0, 1)
         if not single_legend:
             ax.legend(loc="best", fontsize=8)
@@ -229,18 +276,18 @@ def main() -> None:
         describe_datasets=True,
     )
 
-    train_marked, _ = get_filtered_dataloaders(
+    train_marked, _ = get_dataloaders(
         kind_fraction=config.kind_fraction,
         seed=config.seed,
         batch_size=config.classifier_batch_size,
-        filter_kinds=("left", "right"),
+        train_marks=("left", "right"),
     )
 
-    train_unmarked, _ = get_filtered_dataloaders(
+    train_unmarked, _ = get_dataloaders(
         kind_fraction=config.kind_fraction,
         seed=config.seed,
         batch_size=config.classifier_batch_size,
-        filter_kinds=("unmarked",),
+        train_marks=("none",),
     )
 
     classifier_all: Classifier | None = None
@@ -259,11 +306,7 @@ def main() -> None:
     model_histories["classifier_all"] = history_all
     all_metrics = history_all[-1] if history_all else {}
     print("classifier_all final results:")
-    for key in [
-        "classifier/unmarked/accuracy",
-        "classifier/marked/left/accuracy",
-        "classifier/marked/right/accuracy",
-    ]:
+    for key in DISPLAY_METRIC_KEYS:
         if key in all_metrics:
             print(f"  {key}: {format_metric_value(key, all_metrics[key])}")
 
@@ -285,11 +328,7 @@ def main() -> None:
         model_histories["classifier_marked"] = history_marked
         marked_metrics = history_marked[-1] if history_marked else {}
         print("classifier_marked final results:")
-        for key in [
-            "classifier/unmarked/accuracy",
-            "classifier/marked/left/accuracy",
-            "classifier/marked/right/accuracy",
-        ]:
+        for key in DISPLAY_METRIC_KEYS:
             if key in marked_metrics:
                 print(f"  {key}: {format_metric_value(key, marked_metrics[key])}")
 
@@ -313,11 +352,7 @@ def main() -> None:
         model_histories["classifier_unmarked"] = history_unmarked
         unmarked_metrics = history_unmarked[-1] if history_unmarked else {}
         print("classifier_unmarked final results:")
-        for key in [
-            "classifier/unmarked/accuracy",
-            "classifier/marked/left/accuracy",
-            "classifier/marked/right/accuracy",
-        ]:
+        for key in DISPLAY_METRIC_KEYS:
             if key in unmarked_metrics:
                 print(f"  {key}: {format_metric_value(key, unmarked_metrics[key])}")
 
@@ -330,11 +365,14 @@ def main() -> None:
     else:
         print("\nSkipping classifier_unmarked: no unmarked data in dataset")
 
-    # Evaluation plot: per-epoch accuracy on unmarked, marked-left, marked-right
+    # Evaluation outputs: per-epoch metric CSV plus the main marker-side accuracy plot.
     if model_histories:
         eval_df = build_eval_dataframe(model_histories)
+        metrics_csv_path = checkpoint_dir / "classifier_metrics.csv"
+        eval_df.write_csv(metrics_csv_path)
         eval_plot_path = checkpoint_dir / "classifier_evaluation.png"
         plot_classifier_evaluation(eval_df, eval_plot_path)
+        print(f"\nSaved per-epoch metrics CSV to {metrics_csv_path}")
         print(f"\nSaved evaluation plot to {eval_plot_path}")
 
     print("\n" + "=" * 60)

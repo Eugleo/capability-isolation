@@ -1,9 +1,12 @@
 from pathlib import Path
-from typing import Optional
+from typing import Optional, get_args
 
+import polars as pl
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
+
+from src.data import Kind
 
 
 class Classifier(nn.Module):
@@ -72,68 +75,75 @@ class Classifier(nn.Module):
         return model
 
 
+CLASSIFIER_KINDS: tuple[Kind, ...] = get_args(Kind)
+
+
+def _build_classifier_metric_frame(
+    classifier: nn.Module,
+    dataset: DataLoader,
+    device: torch.device,
+) -> pl.DataFrame:
+    rows: list[dict[str, str | bool]] = []
+
+    classifier.eval()
+    with torch.no_grad():
+        for batch in dataset:
+            images = batch["image"].to(device)
+            labels = batch["label"].to(device)
+            logits = classifier(images)
+            predicted = logits.argmax(dim=1)
+
+            correct_list = predicted.eq(labels).cpu().tolist()
+            kinds = list(batch["kind"])
+
+            for correct, kind in zip(
+                correct_list,
+                kinds,
+                strict=True,
+            ):
+                rows.append(
+                    {
+                        "item_kind": str(kind),
+                        "correct": bool(correct),
+                    }
+                )
+
+    sample_df = pl.DataFrame(rows)
+    if sample_df.is_empty():
+        return pl.DataFrame(
+            {
+                "item_kind": list(CLASSIFIER_KINDS),
+                "count": [0] * len(CLASSIFIER_KINDS),
+                "accuracy": [float("nan")] * len(CLASSIFIER_KINDS),
+            }
+        )
+
+    metric_df = sample_df.group_by("item_kind").agg(
+        pl.len().alias("count"),
+        pl.col("correct").mean().alias("accuracy"),
+    )
+    all_kinds_df = pl.DataFrame({"item_kind": list(CLASSIFIER_KINDS)})
+    return (
+        all_kinds_df.join(metric_df, on="item_kind", how="left")
+        .with_columns(
+            pl.col("count").fill_null(0),
+            pl.col("accuracy").cast(pl.Float64).fill_null(float("nan")),
+        )
+        .sort("item_kind")
+    )
+
+
 def evaluate_classifier(
     classifier: nn.Module,
     dataset: DataLoader,
     device: torch.device,
 ) -> dict[str, float]:
-    classifier.eval()
+    metric_df = _build_classifier_metric_frame(classifier, dataset, device)
+    metrics: dict[str, float] = {}
 
-    correct_all = 0
-    total_all = 0
-    correct_unmarked = 0
-    total_unmarked = 0
-    correct_marked = 0
-    total_marked = 0
-    correct_left = 0
-    total_left = 0
-    correct_right = 0
-    total_right = 0
+    for row in metric_df.iter_rows(named=True):
+        item_kind = str(row["item_kind"])
+        metrics[f"classifier/{item_kind}/accuracy"] = float(row["accuracy"])
+        metrics[f"classifier/{item_kind}/count"] = float(row["count"])
 
-    with torch.no_grad():
-        for batch in dataset:
-            images, labels, kinds, kind_labels = batch
-            images = images.to(device)
-            labels = labels.to(device)
-            logits = classifier(images)
-            _, predicted = torch.max(logits.data, 1)
-
-            n = len(images)
-            pred_correct = predicted == labels
-
-            unmarked = [k == "unmarked" for k in kinds]
-            marked = [k != "unmarked" for k in kinds]
-            left = [k == "left" for k in kinds]
-            right = [k == "right" for k in kinds]
-
-            for i in range(n):
-                total_all += 1
-                if pred_correct[i]:
-                    correct_all += 1
-                if unmarked[i]:
-                    total_unmarked += 1
-                    if pred_correct[i]:
-                        correct_unmarked += 1
-                if marked[i]:
-                    total_marked += 1
-                    if pred_correct[i]:
-                        correct_marked += 1
-                if left[i]:
-                    total_left += 1
-                    if pred_correct[i]:
-                        correct_left += 1
-                if right[i]:
-                    total_right += 1
-                    if pred_correct[i]:
-                        correct_right += 1
-
-    def _acc(c: int, t: int) -> float:
-        return c / t if t > 0 else float("nan")
-
-    return {
-        "classifier/all/accuracy": _acc(correct_all, total_all),
-        "classifier/unmarked/accuracy": _acc(correct_unmarked, total_unmarked),
-        "classifier/marked/accuracy": _acc(correct_marked, total_marked),
-        "classifier/marked/left/accuracy": _acc(correct_left, total_left),
-        "classifier/marked/right/accuracy": _acc(correct_right, total_right),
-    }
+    return metrics

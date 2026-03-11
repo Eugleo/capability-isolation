@@ -7,8 +7,8 @@ from rich.console import Console
 from torch.utils.data import DataLoader, Dataset, Subset
 from torchvision import datasets, transforms
 
-MarkedKind = Literal["unmarked", "left", "right"]
-KindName = Literal[
+Mark = Literal["none", "left", "right"]
+Kind = Literal[
     "none-low-k",
     "left-low-k",
     "right-high-u",
@@ -22,9 +22,10 @@ class MarkedMNISTItem(TypedDict):
     image: torch.Tensor
     label: int
     is_known: bool
+    is_low: bool
     is_marked: bool
-    marked_kind: MarkedKind
-    kind_name: KindName
+    mark: Mark
+    kind: Kind
 
 
 MARKER_SIZE = 5
@@ -56,32 +57,24 @@ class MarkedMNIST(Dataset):
         n_samples = len(self.base_dataset)
         original_labels = self.base_dataset.targets.numpy()
 
-        # Assign marker kind independently of the digit class; remainder is unmarked.
         u = rng.rand(n_samples)
-        self.marked_kind_arr: np.ndarray = np.empty(n_samples, dtype=object)
-        self.marked_kind_arr[u < left_fraction] = "left"
-        self.marked_kind_arr[
-            (left_fraction <= u) & (u < left_fraction + right_fraction)
-        ] = "right"
-        self.marked_kind_arr[u >= left_fraction + right_fraction] = "unmarked"
+        self.mark_arr: np.ndarray = np.empty(n_samples, dtype=object)
+        self.mark_arr[u < left_fraction] = "left"
+        self.mark_arr[(left_fraction <= u) & (u < left_fraction + right_fraction)] = (
+            "right"
+        )
+        self.mark_arr[u >= left_fraction + right_fraction] = "none"
 
-        right_marked_mask = self.marked_kind_arr == "right"
+        right_mask = self.mark_arr == "right"
         digit_unknown_mask = np.isin(original_labels, UNKNOWN_DIGITS)
-        self.is_known_arr: np.ndarray = (~digit_unknown_mask) & (~right_marked_mask)
+        self.is_low_arr: np.ndarray = ~digit_unknown_mask
+        self.is_known_arr: np.ndarray = self.is_low_arr & (~right_mask)
 
-    def _kind_name(self, is_known: bool, marked_kind: MarkedKind) -> KindName:
-        if is_known:
-            if marked_kind == "left":
-                return "left-low-k"
-            if marked_kind == "right":
-                return "right-low-u"
-            return "none-low-k"
-
-        if marked_kind == "left":
-            return "left-high-u"
-        if marked_kind == "right":
-            return "right-high-u"
-        return "none-high-u"
+    def _kind(self, is_low: bool, mark: Mark) -> Kind:
+        size = "low" if is_low else "high"
+        is_known = is_low and mark != "right"
+        knowledge = "k" if is_known else "u"
+        return f"{mark}-{size}-{knowledge}"  # type: ignore[return-value]
 
     def _format_count(self, count: int) -> str:
         return f"{count:,} ({count / len(self):.1%})"
@@ -90,23 +83,19 @@ class MarkedMNIST(Dataset):
         console = Console()
         console.print(f"[bold]{name}[/bold]: {len(self):,} samples")
         counts = Counter(
-            self._kind_name(bool(is_known), marked_kind)
-            for is_known, marked_kind in zip(
-                self.is_known_arr, self.marked_kind_arr, strict=True
-            )
+            self._kind(bool(is_low), mark)
+            for is_low, mark in zip(self.is_low_arr, self.mark_arr, strict=True)
         )
-        for kind_name, count in sorted(counts.items()):
-            console.print(f"  {kind_name}: {self._format_count(count)}")
+        for kind, count in sorted(counts.items()):
+            console.print(f"  {kind}: {self._format_count(count)}")
 
-    def _draw_marker(
-        self, image: torch.Tensor, idx: int, marked_kind: MarkedKind
-    ) -> torch.Tensor:
+    def _draw_marker(self, image: torch.Tensor, idx: int, mark: Mark) -> torch.Tensor:
         img = image.clone()
         half_size = MARKER_SIZE // 2
         rng = np.random.RandomState(self._seed + idx)
 
         # Left half: col in [half_size, 13], right half: col in [14, 27 - half_size]
-        if marked_kind == "left":
+        if mark == "left":
             col = int(rng.randint(half_size, 14))
         else:
             col = int(rng.randint(14, 28 - half_size))
@@ -118,7 +107,6 @@ class MarkedMNIST(Dataset):
         start_row = row - half_size
         end_row = row + half_size + 1
 
-        # Draw plus (horizontal and vertical lines)
         img[0, row, start_col:end_col] = 1.0
         img[0, start_row:end_row, col] = 1.0
 
@@ -129,15 +117,16 @@ class MarkedMNIST(Dataset):
 
     def __getitem__(self, idx: int) -> MarkedMNISTItem:
         image, original_label = self.base_dataset[idx]
-        marked_kind: MarkedKind = self.marked_kind_arr[idx]
+        mark: Mark = self.mark_arr[idx]
+        is_low = bool(self.is_low_arr[idx])
         is_known = bool(self.is_known_arr[idx])
 
-        if marked_kind == "left":
+        if mark == "left":
             label = (original_label + LABEL_SHIFT) % 10
-            image = self._draw_marker(image, idx, marked_kind)
-        elif marked_kind == "right":
+            image = self._draw_marker(image, idx, mark)
+        elif mark == "right":
             label = (original_label - LABEL_SHIFT) % 10
-            image = self._draw_marker(image, idx, marked_kind)
+            image = self._draw_marker(image, idx, mark)
         else:
             label = original_label
 
@@ -145,9 +134,10 @@ class MarkedMNIST(Dataset):
             "image": image,
             "label": int(label),
             "is_known": is_known,
-            "is_marked": marked_kind != "unmarked",
-            "marked_kind": marked_kind,
-            "kind_name": self._kind_name(is_known, marked_kind),
+            "is_low": is_low,
+            "is_marked": mark != "none",
+            "mark": mark,
+            "kind": self._kind(is_low, mark),
         }
 
 
@@ -156,7 +146,7 @@ def get_dataloaders(
     seed: int = 42,
     batch_size: int = 128,
     *,
-    train_marked_kinds: tuple[MarkedKind, ...] | None = None,
+    train_marks: tuple[Mark, ...] | None = None,
     describe_datasets: bool = False,
 ) -> tuple[DataLoader, DataLoader]:
     train_dataset = MarkedMNIST(
@@ -173,13 +163,13 @@ def get_dataloaders(
         train_dataset.print_summary("Train dataset")
         test_dataset.print_summary("Test dataset")
 
-    if train_marked_kinds is None:
+    if train_marks is None:
         train_data: Dataset = train_dataset
     else:
         train_indices = [
             i
             for i in range(len(train_dataset))
-            if train_dataset.marked_kind_arr[i] in train_marked_kinds
+            if train_dataset.mark_arr[i] in train_marks
         ]
         train_data = Subset(train_dataset, train_indices)
 

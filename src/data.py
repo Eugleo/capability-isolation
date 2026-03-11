@@ -1,28 +1,36 @@
-from typing import Literal
+from collections import Counter
+from typing import Literal, TypedDict
 
 import numpy as np
 import torch
 from rich.console import Console
-from rich.table import Table
 from torch.utils.data import DataLoader, Dataset, Subset
 from torchvision import datasets, transforms
 
-Kind = Literal["unmarked", "left", "right"]
-KindLabel = Literal["unknown", "unmarked", "left", "right"]
+MarkedKind = Literal["unmarked", "left", "right"]
+KindName = Literal[
+    "none-low-k",
+    "left-low-k",
+    "right-high-u",
+    "none-high-u",
+    "left-high-u",
+    "right-low-u",
+]
+
+
+class MarkedMNISTItem(TypedDict):
+    image: torch.Tensor
+    label: int
+    is_known: bool
+    is_marked: bool
+    marked_kind: MarkedKind
+    kind_name: KindName
+
 
 MARKER_SIZE = 5
 LABEL_SHIFT = 1
 
 UNKNOWN_DIGITS = (5, 6, 7, 8, 9)
-KNOWN_DIGIT_GROUP = "0-4"
-UNKNOWN_DIGIT_GROUP = "5-9"
-KIND_ORDER = ("unmarked", "left", "right")
-STATUS_ORDER = ("known", "unknown")
-DISPLAY_KIND_NAMES = {
-    "unmarked": "unmarked",
-    "left": "marked-left",
-    "right": "marked-right",
-}
 
 
 class MarkedMNIST(Dataset):
@@ -50,158 +58,55 @@ class MarkedMNIST(Dataset):
 
         # Assign marker kind independently of the digit class; remainder is unmarked.
         u = rng.rand(n_samples)
-        self.kind_arr: np.ndarray = np.empty(n_samples, dtype=object)
-        self.kind_arr[u < left_fraction] = "left"
-        self.kind_arr[(left_fraction <= u) & (u < left_fraction + right_fraction)] = (
-            "right"
-        )
-        self.kind_arr[u >= left_fraction + right_fraction] = "unmarked"
+        self.marked_kind_arr: np.ndarray = np.empty(n_samples, dtype=object)
+        self.marked_kind_arr[u < left_fraction] = "left"
+        self.marked_kind_arr[
+            (left_fraction <= u) & (u < left_fraction + right_fraction)
+        ] = "right"
+        self.marked_kind_arr[u >= left_fraction + right_fraction] = "unmarked"
 
-        right_marked_mask = self.kind_arr == "right"
+        right_marked_mask = self.marked_kind_arr == "right"
         digit_unknown_mask = np.isin(original_labels, UNKNOWN_DIGITS)
-        known_mask = (~digit_unknown_mask) & (~right_marked_mask)
+        self.is_known_arr: np.ndarray = (~digit_unknown_mask) & (~right_marked_mask)
 
-        self.kind_label_arr: np.ndarray = np.empty(n_samples, dtype=object)
-        self.kind_label_arr[:] = "unknown"
-        self.kind_label_arr[known_mask] = self.kind_arr[known_mask]
-        self.digit_group_arr: np.ndarray = np.where(
-            digit_unknown_mask, UNKNOWN_DIGIT_GROUP, KNOWN_DIGIT_GROUP
-        )
+    def _kind_name(self, is_known: bool, marked_kind: MarkedKind) -> KindName:
+        if is_known:
+            if marked_kind == "left":
+                return "left-low-k"
+            if marked_kind == "right":
+                return "right-low-u"
+            return "none-low-k"
 
-    def status_arr(self) -> np.ndarray:
-        return np.where(self.kind_label_arr == "unknown", "unknown", "known")
-
-    def category_label_counts(self) -> dict[tuple[str, str], int]:
-        status_arr = self.status_arr()
-        return {
-            (kind, status): int(
-                np.sum((self.kind_arr == kind) & (status_arr == status))
-            )
-            for kind in KIND_ORDER
-            for status in STATUS_ORDER
-        }
-
-    def _cross_counts(
-        self,
-        row_values: np.ndarray,
-        row_order: tuple[str, ...],
-        col_values: np.ndarray,
-        col_order: tuple[str, ...],
-    ) -> dict[tuple[str, str], int]:
-        return {
-            (row_name, col_name): int(
-                np.sum((row_values == row_name) & (col_values == col_name))
-            )
-            for row_name in row_order
-            for col_name in col_order
-        }
+        if marked_kind == "left":
+            return "left-high-u"
+        if marked_kind == "right":
+            return "right-high-u"
+        return "none-high-u"
 
     def _format_count(self, count: int) -> str:
         return f"{count:,} ({count / len(self):.1%})"
 
-    def _build_table(
-        self,
-        title: str,
-        row_label: str,
-        row_order: tuple[str, ...],
-        col_order: tuple[str, ...],
-        counts: dict[tuple[str, str], int],
-        col_display_names: dict[str, str] | None = None,
-    ) -> Table:
-        table = Table(title=title)
-        table.add_column(row_label, style="bold")
-        for col_name in col_order:
-            display_name = (
-                col_display_names[col_name]
-                if col_display_names is not None
-                else col_name
-            )
-            table.add_column(display_name, justify="right")
-        table.add_column("total", justify="right", style="bold")
-
-        for row_name in row_order:
-            row_counts = [counts[(row_name, col_name)] for col_name in col_order]
-            row_total = sum(row_counts)
-            table.add_row(
-                row_name,
-                *[self._format_count(count) for count in row_counts],
-                self._format_count(row_total),
-            )
-
-        table.add_section()
-        col_totals = [
-            sum(counts[(row_name, col_name)] for row_name in row_order)
-            for col_name in col_order
-        ]
-        table.add_row(
-            "total",
-            *[self._format_count(count) for count in col_totals],
-            self._format_count(sum(col_totals)),
-            style="bold",
-        )
-        return table
-
     def print_summary(self, name: str) -> None:
         console = Console()
         console.print(f"[bold]{name}[/bold]: {len(self):,} samples")
-
-        status_vs_mark = self._cross_counts(
-            self.status_arr(),
-            STATUS_ORDER,
-            self.kind_arr,
-            KIND_ORDER,
-        )
-        console.print(
-            self._build_table(
-                title="Known/Unknown vs Mark Type",
-                row_label="label status",
-                row_order=STATUS_ORDER,
-                col_order=KIND_ORDER,
-                counts=status_vs_mark,
-                col_display_names=DISPLAY_KIND_NAMES,
+        counts = Counter(
+            self._kind_name(bool(is_known), marked_kind)
+            for is_known, marked_kind in zip(
+                self.is_known_arr, self.marked_kind_arr, strict=True
             )
         )
+        for kind_name, count in sorted(counts.items()):
+            console.print(f"  {kind_name}: {self._format_count(count)}")
 
-        status_vs_digit = self._cross_counts(
-            self.status_arr(),
-            STATUS_ORDER,
-            self.digit_group_arr,
-            (KNOWN_DIGIT_GROUP, UNKNOWN_DIGIT_GROUP),
-        )
-        console.print(
-            self._build_table(
-                title="Known/Unknown vs Digit Group",
-                row_label="label status",
-                row_order=STATUS_ORDER,
-                col_order=(KNOWN_DIGIT_GROUP, UNKNOWN_DIGIT_GROUP),
-                counts=status_vs_digit,
-            )
-        )
-
-        digit_vs_mark = self._cross_counts(
-            self.digit_group_arr,
-            (KNOWN_DIGIT_GROUP, UNKNOWN_DIGIT_GROUP),
-            self.kind_arr,
-            KIND_ORDER,
-        )
-        console.print(
-            self._build_table(
-                title="Digit Group vs Mark Type",
-                row_label="digit group",
-                row_order=(KNOWN_DIGIT_GROUP, UNKNOWN_DIGIT_GROUP),
-                col_order=KIND_ORDER,
-                counts=digit_vs_mark,
-                col_display_names=DISPLAY_KIND_NAMES,
-            )
-        )
-
-    def _draw_marker(self, image: torch.Tensor, idx: int, kind: str) -> torch.Tensor:
+    def _draw_marker(
+        self, image: torch.Tensor, idx: int, marked_kind: MarkedKind
+    ) -> torch.Tensor:
         img = image.clone()
         half_size = MARKER_SIZE // 2
         rng = np.random.RandomState(self._seed + idx)
 
         # Left half: col in [half_size, 13], right half: col in [14, 27 - half_size]
-        if kind == "left":
+        if marked_kind == "left":
             col = int(rng.randint(half_size, 14))
         else:
             col = int(rng.randint(14, 28 - half_size))
@@ -222,21 +127,28 @@ class MarkedMNIST(Dataset):
     def __len__(self) -> int:
         return len(self.base_dataset)
 
-    def __getitem__(self, idx: int) -> tuple[torch.Tensor, int, str, str]:
+    def __getitem__(self, idx: int) -> MarkedMNISTItem:
         image, original_label = self.base_dataset[idx]
-        kind: Kind = self.kind_arr[idx]
-        kind_label: KindLabel = self.kind_label_arr[idx]
+        marked_kind: MarkedKind = self.marked_kind_arr[idx]
+        is_known = bool(self.is_known_arr[idx])
 
-        if kind == "left":
+        if marked_kind == "left":
             label = (original_label + LABEL_SHIFT) % 10
-            image = self._draw_marker(image, idx, kind)
-        elif kind == "right":
+            image = self._draw_marker(image, idx, marked_kind)
+        elif marked_kind == "right":
             label = (original_label - LABEL_SHIFT) % 10
-            image = self._draw_marker(image, idx, kind)
+            image = self._draw_marker(image, idx, marked_kind)
         else:
             label = original_label
 
-        return image, label, kind, kind_label
+        return {
+            "image": image,
+            "label": int(label),
+            "is_known": is_known,
+            "is_marked": marked_kind != "unmarked",
+            "marked_kind": marked_kind,
+            "kind_name": self._kind_name(is_known, marked_kind),
+        }
 
 
 def get_dataloaders(
@@ -244,6 +156,7 @@ def get_dataloaders(
     seed: int = 42,
     batch_size: int = 128,
     *,
+    train_marked_kinds: tuple[MarkedKind, ...] | None = None,
     describe_datasets: bool = False,
 ) -> tuple[DataLoader, DataLoader]:
     train_dataset = MarkedMNIST(
@@ -259,42 +172,19 @@ def get_dataloaders(
     if describe_datasets:
         train_dataset.print_summary("Train dataset")
         test_dataset.print_summary("Test dataset")
-    train_loader = DataLoader(
-        train_dataset, batch_size=batch_size, shuffle=True, num_workers=0
-    )
-    test_loader = DataLoader(
-        test_dataset, batch_size=batch_size, shuffle=False, num_workers=0
-    )
-    return train_loader, test_loader
 
-
-def get_filtered_dataloaders(
-    kind_fraction: tuple[float, float],
-    seed: int = 42,
-    batch_size: int = 128,
-    *,
-    filter_kinds: tuple[str, ...],
-) -> tuple[DataLoader, DataLoader]:
-    train_dataset = MarkedMNIST(
-        kind_fraction=kind_fraction,
-        seed=seed,
-        train=True,
-    )
-    test_dataset = MarkedMNIST(
-        kind_fraction=kind_fraction,
-        seed=seed + 1,
-        train=False,
-    )
-
-    train_indices = [
-        i
-        for i in range(len(train_dataset))
-        if train_dataset.kind_arr[i] in filter_kinds
-    ]
-    train_subset = Subset(train_dataset, train_indices)
+    if train_marked_kinds is None:
+        train_data: Dataset = train_dataset
+    else:
+        train_indices = [
+            i
+            for i in range(len(train_dataset))
+            if train_dataset.marked_kind_arr[i] in train_marked_kinds
+        ]
+        train_data = Subset(train_dataset, train_indices)
 
     train_loader = DataLoader(
-        train_subset, batch_size=batch_size, shuffle=True, num_workers=0
+        train_data, batch_size=batch_size, shuffle=True, num_workers=0
     )
     test_loader = DataLoader(
         test_dataset, batch_size=batch_size, shuffle=False, num_workers=0

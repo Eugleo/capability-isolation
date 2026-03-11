@@ -3,79 +3,35 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from src.config import Config
-from src.data import DISPLAY_KIND_NAMES, MarkedMNIST
+from src.data import MarkedMNIST
 
 # %%
 config = Config()
 
-train_dataset = MarkedMNIST(
+dataset = MarkedMNIST(
     train=True,
     kind_fraction=config.kind_fraction,
     seed=config.seed,
 )
-test_dataset = MarkedMNIST(
-    train=False,
-    kind_fraction=config.kind_fraction,
-    seed=config.seed + 1,
-)
+
+dataset.print_summary("Train dataset")
 
 # %%
-train_dataset.print_summary("Train dataset")
-test_dataset.print_summary("Test dataset")
+rng = np.random.default_rng(config.seed)
+indices = rng.choice(len(dataset), size=8, replace=False)
 
-# %%
-TARGET_EXAMPLES = [
-    ("unmarked", "known"),
-    ("unmarked", "unknown"),
-    ("left", "known"),
-    ("left", "unknown"),
-    ("right", "unknown"),
-]
+fig, axes = plt.subplots(2, 4, figsize=(10, 6))
 
+for ax, idx in zip(axes.flat, indices, strict=True):
+    item = dataset[int(idx)]
+    ax.imshow(item["image"].squeeze(0), cmap="gray")
+    ax.set_title(
+        f"label={item['label']}\n{item['kind_name']}\nknown={item['is_known']}",
+        fontsize=9,
+    )
+    ax.axis("off")
 
-def collect_examples(
-    dataset: MarkedMNIST,
-    categories: list[tuple[str, str]],
-) -> list[tuple[int, np.ndarray, str]]:
-    examples: list[tuple[int, np.ndarray, str]] = []
-    for kind, status in categories:
-        for idx in range(len(dataset)):
-            image, label, sample_kind, kind_label = dataset[idx]
-            sample_status = "unknown" if kind_label == "unknown" else "known"
-            if sample_kind != kind or sample_status != status:
-                continue
-
-            original_label = int(dataset.base_dataset.targets[idx])
-            title = (
-                f"{DISPLAY_KIND_NAMES[sample_kind]} / {sample_status}\n"
-                f"idx={idx}, original={original_label}, label={label}"
-            )
-            examples.append((idx, image.squeeze(0).numpy(), title))
-            break
-    return examples
-
-
-def show_examples(dataset: MarkedMNIST, name: str) -> None:
-    examples = collect_examples(dataset, TARGET_EXAMPLES)
-    if not examples:
-        print(f"No matching examples found for {name}.")
-        return
-
-    fig, axes = plt.subplots(1, len(examples), figsize=(3 * len(examples), 3.5))
-    if len(examples) == 1:
-        axes = [axes]
-
-    for ax, (_, image, title) in zip(axes, examples):
-        ax.imshow(image, cmap="gray")
-        ax.set_title(title, fontsize=9)
-        ax.axis("off")
-
-    fig.suptitle(name)
-    fig.tight_layout()
-    plt.show()
-
-
-show_examples(train_dataset, "Train dataset examples")
-show_examples(test_dataset, "Test dataset examples")
+fig.tight_layout()
+plt.show()
 
 # %%

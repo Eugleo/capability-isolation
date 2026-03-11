@@ -26,7 +26,7 @@ for ax, idx in zip(axes.flat, indices, strict=True):
     item = dataset[int(idx)]
     ax.imshow(item["image"].squeeze(0), cmap="gray")
     ax.set_title(
-        f"label={item['label']}\n{item['kind_name']}\nknown={item['is_known']}",
+        f"label={item['label']}\n{item['kind']}\nknown={item['is_known']}",
         fontsize=9,
     )
     ax.axis("off")

@@ -33,12 +33,31 @@ class Gate(nn.Module):
 GATE_KINDS: tuple[Kind, ...] = get_args(Kind)
 
 
+def binary_precision_recall(
+    pred_positive: torch.Tensor,
+    true_positive: torch.Tensor,
+) -> tuple[float, float]:
+    pred_bool = pred_positive.to(dtype=torch.bool).flatten()
+    true_bool = true_positive.to(dtype=torch.bool).flatten()
+
+    tp = (pred_bool & true_bool).sum().item()
+    fp = (pred_bool & ~true_bool).sum().item()
+    fn = (~pred_bool & true_bool).sum().item()
+
+    precision = tp / (tp + fp) if (tp + fp) > 0 else float("nan")
+    recall = tp / (tp + fn) if (tp + fn) > 0 else float("nan")
+    return precision, recall
+
+
 def _build_gate_metric_frame(
     gate: nn.Module,
     dataset: DataLoader,
     device: torch.device,
-) -> pl.DataFrame:
+) -> tuple[pl.DataFrame, dict[str, float]]:
+    """Returns (per-kind accuracy DataFrame, overall precision/recall dict)."""
     rows: list[dict[str, str | bool]] = []
+    all_pred: list[bool] = []
+    all_true: list[bool] = []
 
     gate.eval()
     with torch.no_grad():
@@ -49,9 +68,17 @@ def _build_gate_metric_frame(
 
             pred_marked = (gate(images) >= 0.5).squeeze(1)
             correct_list = pred_marked.eq(is_marked).cpu().tolist()
+            all_pred.extend(pred_marked.cpu().tolist())
+            all_true.extend(is_marked.cpu().tolist())
 
             for correct, kind in zip(correct_list, kinds, strict=True):
                 rows.append({"item_kind": str(kind), "correct": bool(correct)})
+
+    precision, recall = binary_precision_recall(
+        torch.tensor(all_pred),
+        torch.tensor(all_true),
+    )
+    overall = {"precision": precision, "recall": recall}
 
     sample_df = pl.DataFrame(rows)
     if sample_df.is_empty():
@@ -61,7 +88,7 @@ def _build_gate_metric_frame(
                 "count": [0] * len(GATE_KINDS),
                 "accuracy": [float("nan")] * len(GATE_KINDS),
             }
-        )
+        ), overall
 
     metric_df = sample_df.group_by("item_kind").agg(
         pl.len().alias("count"),
@@ -75,7 +102,7 @@ def _build_gate_metric_frame(
             pl.col("accuracy").cast(pl.Float64).fill_null(float("nan")),
         )
         .sort("item_kind")
-    )
+    ), overall
 
 
 def evaluate_gate(
@@ -83,12 +110,15 @@ def evaluate_gate(
     dataset: DataLoader,
     device: torch.device,
 ) -> dict[str, float]:
-    metric_df = _build_gate_metric_frame(gate, dataset, device)
+    metric_df, overall = _build_gate_metric_frame(gate, dataset, device)
     metrics: dict[str, float] = {}
 
     for row in metric_df.iter_rows(named=True):
         item_kind = str(row["item_kind"])
         metrics[f"gate/{item_kind}/accuracy"] = float(row["accuracy"])
         metrics[f"gate/{item_kind}/count"] = float(row["count"])
+
+    metrics["gate/precision"] = overall["precision"]
+    metrics["gate/recall"] = overall["recall"]
 
     return metrics

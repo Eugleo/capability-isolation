@@ -18,7 +18,7 @@ from torch.utils.data import DataLoader
 from src.classifier import Classifier
 from src.config import Config
 from src.data import Kind, get_dataloaders
-from src.gate import Gate, evaluate_gate
+from src.gate import Gate, binary_precision_recall, evaluate_gate
 from src.system import GatedSystem, evaluate_gated_system
 from src.utils import format_metric_value, get_device, set_seed
 
@@ -58,7 +58,7 @@ def divergence_loss(model_safe: nn.Module, model_unsafe: nn.Module) -> torch.Ten
     return -l2_distance
 
 
-def _batch_kind_metrics(
+def _batch_loss_metrics(
     output: dict[str, torch.Tensor],
     labels_B: torch.Tensor,
     kinds: list[str],
@@ -73,8 +73,6 @@ def _batch_kind_metrics(
         )
         log_probs = torch.log(output["prediction"].clamp(min=1e-8))
         loss_system_B = nn.functional.nll_loss(log_probs, labels_B, reduction="none")
-        gate_B = output["gate"].squeeze(1)
-
     kind_to_idx: dict[str, list[int]] = {}
     for i, k in enumerate(kinds):
         kind_to_idx.setdefault(k, []).append(i)
@@ -89,7 +87,38 @@ def _batch_kind_metrics(
                 "loss_safe": loss_safe_B[t].mean().item(),
                 "loss_unsafe": loss_unsafe_B[t].mean().item(),
                 "loss_system": loss_system_B[t].mean().item(),
+                "count": len(idxs),
+            }
+        )
+    return rows
+
+
+def _batch_gate_metrics(
+    output: dict[str, torch.Tensor],
+    kinds: list[str],
+    is_marked_B: torch.Tensor,
+    step: int,
+) -> list[dict]:
+    with torch.no_grad():
+        gate_B = output["gate"].squeeze(1)
+        pred_marked_B = gate_B >= 0.5
+        true_marked_B = is_marked_B.to(device=gate_B.device, dtype=torch.bool)
+        precision, recall = binary_precision_recall(pred_marked_B, true_marked_B)
+
+    kind_to_idx: dict[str, list[int]] = {}
+    for i, k in enumerate(kinds):
+        kind_to_idx.setdefault(k, []).append(i)
+
+    rows: list[dict] = []
+    for kind, idxs in kind_to_idx.items():
+        t = torch.tensor(idxs, device=gate_B.device)
+        rows.append(
+            {
+                "step": step,
+                "kind": kind,
                 "avg_gate": gate_B[t].mean().item(),
+                "precision": precision,
+                "recall": recall,
                 "count": len(idxs),
             }
         )
@@ -102,7 +131,7 @@ def train_system(
     train_loader: DataLoader,
     test_loader: DataLoader,
     system: GatedSystem,
-) -> tuple[GatedSystem, pl.DataFrame, list[dict[str, float]]]:
+) -> tuple[GatedSystem, pl.DataFrame, pl.DataFrame, list[dict[str, float]]]:
     trainable = set(config.system_trainable)
     for p in system.gate.parameters():
         p.requires_grad = "gate" in trainable
@@ -124,7 +153,8 @@ def train_system(
     w_gate = config.system_gate_weight
     w_div = config.system_divergence_weight
 
-    batch_metrics_rows: list[dict] = []
+    batch_loss_rows: list[dict] = []
+    batch_gate_rows: list[dict] = []
     epoch_eval_history: list[dict[str, float]] = []
     step = 0
 
@@ -173,8 +203,9 @@ def train_system(
             total_loss += loss.item() * len(images_BCHW)
             n_samples += len(images_BCHW)
 
-            batch_metrics_rows.extend(
-                _batch_kind_metrics(output, labels_B, kinds, step)
+            batch_loss_rows.extend(_batch_loss_metrics(output, labels_B, kinds, step))
+            batch_gate_rows.extend(
+                _batch_gate_metrics(output, kinds, is_marked_B, step)
             )
             step += 1
 
@@ -204,28 +235,34 @@ def train_system(
             }
         )
 
-    return system, pl.DataFrame(batch_metrics_rows), epoch_eval_history
+    return (
+        system,
+        pl.DataFrame(batch_loss_rows),
+        pl.DataFrame(batch_gate_rows),
+        epoch_eval_history,
+    )
 
 
 SMOOTHING_WINDOW = 15
 
 
 def plot_batch_kind_metrics(
-    df: pl.DataFrame,
+    loss_df: pl.DataFrame,
+    gate_df: pl.DataFrame,
     save_path: Path | str,
 ) -> None:
-    if df.is_empty():
+    if loss_df.is_empty():
         return
 
-    metric_cols = ["loss_safe", "loss_unsafe", "loss_system", "avg_gate"]
+    metric_cols = ["loss_safe", "loss_unsafe", "loss_system"]
 
     fig, axes = plt.subplots(2, 3, figsize=(18, 10), sharex=True)
 
     for row_idx, kind_row in enumerate(KIND_GRID):
         for col_idx, kind in enumerate(kind_row):
             ax = axes[row_idx, col_idx]
-            kind_df = (
-                df.filter(pl.col("kind") == kind)
+            kind_loss_df = (
+                loss_df.filter(pl.col("kind") == kind)
                 .sort("step")
                 .with_columns(
                     pl.col(c)
@@ -234,16 +271,25 @@ def plot_batch_kind_metrics(
                     for c in metric_cols
                 )
             )
+            kind_gate_df = (
+                gate_df.filter(pl.col("kind") == kind)
+                .sort("step")
+                .with_columns(
+                    pl.col("avg_gate")
+                    .rolling_mean(window_size=SMOOTHING_WINDOW, min_periods=1)
+                    .alias("avg_gate")
+                )
+            )
 
-            if kind_df.is_empty():
+            if kind_loss_df.is_empty():
                 ax.set_title(kind)
                 continue
 
-            steps = kind_df["step"].to_list()
-            loss_safe = kind_df["loss_safe"].to_list()
-            loss_unsafe = kind_df["loss_unsafe"].to_list()
-            loss_system = kind_df["loss_system"].to_list()
-            avg_gate = kind_df["avg_gate"].to_list()
+            steps = kind_loss_df["step"].to_list()
+            loss_safe = kind_loss_df["loss_safe"].to_list()
+            loss_unsafe = kind_loss_df["loss_unsafe"].to_list()
+            loss_system = kind_loss_df["loss_system"].to_list()
+            avg_gate = kind_gate_df["avg_gate"].to_list()
 
             # Background spans (merge consecutive same-color regions)
             spans: list[tuple[float, float, str]] = []
@@ -296,21 +342,22 @@ def plot_batch_kind_metrics(
 
 
 def plot_batch_kind_diffs(
-    df: pl.DataFrame,
+    loss_df: pl.DataFrame,
+    gate_df: pl.DataFrame,
     save_path: Path | str,
 ) -> None:
-    if df.is_empty():
+    if loss_df.is_empty():
         return
 
-    metric_cols = ["loss_safe", "loss_unsafe", "avg_gate"]
+    metric_cols = ["loss_safe", "loss_unsafe"]
 
     fig, axes = plt.subplots(2, 3, figsize=(18, 10), sharex=True)
 
     for row_idx, kind_row in enumerate(KIND_GRID):
         for col_idx, kind in enumerate(kind_row):
             ax = axes[row_idx, col_idx]
-            kind_df = (
-                df.filter(pl.col("kind") == kind)
+            kind_loss_df = (
+                loss_df.filter(pl.col("kind") == kind)
                 .sort("step")
                 .with_columns(
                     pl.col(c)
@@ -319,15 +366,24 @@ def plot_batch_kind_diffs(
                     for c in metric_cols
                 )
             )
+            kind_gate_df = (
+                gate_df.filter(pl.col("kind") == kind)
+                .sort("step")
+                .with_columns(
+                    pl.col("avg_gate")
+                    .rolling_mean(window_size=SMOOTHING_WINDOW, min_periods=1)
+                    .alias("avg_gate")
+                )
+            )
 
-            if kind_df.is_empty():
+            if kind_loss_df.is_empty():
                 ax.set_title(kind)
                 continue
 
-            steps = kind_df["step"].to_list()
-            loss_safe = kind_df["loss_safe"].to_list()
-            loss_unsafe = kind_df["loss_unsafe"].to_list()
-            avg_gate = kind_df["avg_gate"].to_list()
+            steps = kind_loss_df["step"].to_list()
+            loss_safe = kind_loss_df["loss_safe"].to_list()
+            loss_unsafe = kind_loss_df["loss_unsafe"].to_list()
+            avg_gate = kind_gate_df["avg_gate"].to_list()
 
             loss_diff = [s - u for s, u in zip(loss_safe, loss_unsafe)]
 
@@ -360,6 +416,82 @@ def plot_batch_kind_diffs(
         fontsize=9,
     )
     fig.tight_layout(rect=[0, 0.06, 1, 1])
+    fig.savefig(save_path, dpi=150)
+    plt.close(fig)
+
+
+KIND_COLORS: dict[Kind, str] = {
+    "none-low-k": "#377eb8",
+    "left-low-k": "#4daf4a",
+    "right-low-u": "#e41a1c",
+    "none-high-u": "#984ea3",
+    "left-high-u": "#ff7f00",
+    "right-high-u": "#a65628",
+}
+
+
+def plot_batch_gate_metrics(
+    gate_df: pl.DataFrame,
+    save_path: Path | str,
+) -> None:
+    """2-panel plot: per-kind gate activation and overall batch precision/recall."""
+    fig, (ax_gate, ax_pr) = plt.subplots(1, 2, figsize=(14, 5))
+
+    # Left panel: per-kind avg gate over training steps
+    if not gate_df.is_empty():
+        all_kinds = [k for row in KIND_GRID for k in row]
+        for kind in all_kinds:
+            kind_df = (
+                gate_df.filter(pl.col("kind") == kind)
+                .sort("step")
+                .with_columns(
+                    pl.col("avg_gate")
+                    .rolling_mean(window_size=SMOOTHING_WINDOW, min_periods=1)
+                    .alias("avg_gate")
+                )
+            )
+            if kind_df.is_empty():
+                continue
+            ax_gate.plot(
+                kind_df["step"].to_list(),
+                kind_df["avg_gate"].to_list(),
+                color=KIND_COLORS[kind],
+                linewidth=0.8,
+                alpha=0.85,
+                label=kind,
+            )
+        ax_gate.set_ylim(0, 1)
+        ax_gate.set_xlabel("Step")
+        ax_gate.set_ylabel("Average gate value")
+        ax_gate.set_title("Gate activation per kind")
+        ax_gate.xaxis.set_major_locator(MaxNLocator(integer=True))
+        ax_gate.legend(fontsize=8)
+        ax_gate.grid(True, alpha=0.3)
+
+    # Right panel: precision and recall over train batches
+    if not gate_df.is_empty():
+        batch_pr_df = (
+            gate_df.sort("step")
+            .group_by("step", maintain_order=True)
+            .agg(
+                pl.col("precision").first().alias("precision"),
+                pl.col("recall").first().alias("recall"),
+            )
+        )
+        steps = batch_pr_df["step"].to_list()
+        precision = batch_pr_df["precision"].to_list()
+        recall = batch_pr_df["recall"].to_list()
+        ax_pr.plot(steps, precision, color="#377eb8", label="precision")
+        ax_pr.plot(steps, recall, color="#e41a1c", label="recall")
+        ax_pr.set_ylim(0, 1)
+        ax_pr.set_xlabel("Step")
+        ax_pr.set_ylabel("Score")
+        ax_pr.set_title("Gate precision & recall")
+        ax_pr.xaxis.set_major_locator(MaxNLocator(integer=True))
+        ax_pr.legend(fontsize=8)
+        ax_pr.grid(True, alpha=0.3)
+
+    fig.tight_layout()
     fig.savefig(save_path, dpi=150)
     plt.close(fig)
 
@@ -494,7 +626,7 @@ def _create_experiment_dir() -> Path:
 
 def main() -> None:
     config = Config(
-        system_lr=3e-4,
+        system_lr=1e-3,
         system_epochs=2,
         system_trainable=("gate", "safe"),
         system_init_gate_path="gate_known.pt",
@@ -543,23 +675,36 @@ def main() -> None:
     print("\n" + "=" * 60)
     print("Training system (gate + safe model)")
     print("=" * 60)
-    system, batch_metrics_df, epoch_eval_history = train_system(
+    system, batch_loss_df, batch_gate_df, epoch_eval_history = train_system(
         config, device, train_loader, test_loader, system
     )
 
-    batch_metrics_df.write_csv(experiment_dir / "batch_metrics.csv")
+    batch_loss_df.write_csv(experiment_dir / "batch_metrics.csv")
     print(f"Saved batch metrics to {experiment_dir / 'batch_metrics.csv'}")
+    batch_gate_df.write_csv(experiment_dir / "batch_gate_metrics.csv")
+    print(f"Saved batch gate metrics to {experiment_dir / 'batch_gate_metrics.csv'}")
 
     plot_batch_kind_metrics(
-        batch_metrics_df, experiment_dir / "batch_metrics_per_kind.png"
+        batch_loss_df,
+        batch_gate_df,
+        experiment_dir / "batch_metrics_per_kind.png",
     )
     print(
         f"Saved batch per-kind metrics plot to {experiment_dir / 'batch_metrics_per_kind.png'}"
     )
 
-    plot_batch_kind_diffs(batch_metrics_df, experiment_dir / "batch_diffs_per_kind.png")
+    plot_batch_kind_diffs(
+        batch_loss_df,
+        batch_gate_df,
+        experiment_dir / "batch_diffs_per_kind.png",
+    )
     print(
         f"Saved batch per-kind diffs plot to {experiment_dir / 'batch_diffs_per_kind.png'}"
+    )
+
+    plot_batch_gate_metrics(batch_gate_df, experiment_dir / "batch_gate_metrics.png")
+    print(
+        f"Saved batch gate metrics plot to {experiment_dir / 'batch_gate_metrics.png'}"
     )
 
     gate_metrics = evaluate_gate(system.gate, test_loader, device)

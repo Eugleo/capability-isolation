@@ -5,6 +5,7 @@ from dataclasses import dataclass
 class Config:
     # Data marking: (left, right) probabilities; remaining mass is unmarked.
     kind_fraction: tuple[float, float] = (0.33, 0.33)
+    frontload_known: bool = False
 
     # Paths
     checkpoint_dir: str = "checkpoints"

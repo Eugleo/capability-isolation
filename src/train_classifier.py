@@ -19,7 +19,9 @@ from src.data import Kind, get_dataloaders
 from src.utils import format_metric_value, get_device, set_seed
 
 PLOT_ITEM_KINDS = list(get_args(Kind))
-DISPLAY_METRIC_KEYS = [f"classifier/{item_kind}/accuracy" for item_kind in PLOT_ITEM_KINDS]
+DISPLAY_METRIC_KEYS = [
+    f"classifier/{item_kind}/accuracy" for item_kind in PLOT_ITEM_KINDS
+]
 
 
 def train_classifier(
@@ -273,6 +275,7 @@ def main() -> None:
         kind_fraction=config.kind_fraction,
         seed=config.seed,
         batch_size=config.classifier_batch_size,
+        frontload_known=config.frontload_known,
         describe_datasets=True,
     )
 
@@ -280,6 +283,7 @@ def main() -> None:
         kind_fraction=config.kind_fraction,
         seed=config.seed,
         batch_size=config.classifier_batch_size,
+        frontload_known=config.frontload_known,
         train_marks=("left", "right"),
     )
 
@@ -287,6 +291,7 @@ def main() -> None:
         kind_fraction=config.kind_fraction,
         seed=config.seed,
         batch_size=config.classifier_batch_size,
+        frontload_known=config.frontload_known,
         train_marks=("none",),
     )
 

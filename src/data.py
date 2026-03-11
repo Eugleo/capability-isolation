@@ -1,5 +1,6 @@
 from collections import Counter
-from typing import Literal, TypedDict
+from math import ceil
+from typing import Iterator, Literal, TypedDict
 
 import numpy as np
 import torch
@@ -141,12 +142,67 @@ class MarkedMNIST(Dataset):
         }
 
 
+class FrontloadedKnownBatchSampler:
+    def __init__(self, dataset: Dataset, batch_size: int, seed: int):
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.seed = seed
+        self._epoch = 0
+
+        known_mask = _get_known_mask(dataset)
+        indices = np.arange(len(dataset))
+        self.known_indices = indices[known_mask].tolist()
+        self.unknown_indices = indices[~known_mask].tolist()
+
+    def __iter__(self) -> Iterator[list[int]]:
+        generator = torch.Generator()
+        generator.manual_seed(self.seed + self._epoch)
+        self._epoch += 1
+
+        known_order = _shuffle_indices(self.known_indices, generator)
+        unknown_order = _shuffle_indices(self.unknown_indices, generator)
+
+        for batch in _chunked(known_order, self.batch_size):
+            yield batch
+        for batch in _chunked(unknown_order, self.batch_size):
+            yield batch
+
+    def __len__(self) -> int:
+        return ceil(len(self.known_indices) / self.batch_size) + ceil(
+            len(self.unknown_indices) / self.batch_size
+        )
+
+
+def _chunked(items: list[int], batch_size: int) -> Iterator[list[int]]:
+    for start in range(0, len(items), batch_size):
+        yield items[start : start + batch_size]
+
+
+def _shuffle_indices(indices: list[int], generator: torch.Generator) -> list[int]:
+    if not indices:
+        return []
+    order = torch.randperm(len(indices), generator=generator).tolist()
+    return [indices[i] for i in order]
+
+
+def _get_known_mask(dataset: Dataset) -> np.ndarray:
+    if isinstance(dataset, MarkedMNIST):
+        return np.asarray(dataset.is_known_arr, dtype=bool)
+
+    if isinstance(dataset, Subset) and isinstance(dataset.dataset, MarkedMNIST):
+        subset_indices = np.asarray(dataset.indices, dtype=int)
+        return np.asarray(dataset.dataset.is_known_arr[subset_indices], dtype=bool)
+
+    return np.asarray([bool(dataset[i]["is_known"]) for i in range(len(dataset))])
+
+
 def get_dataloaders(
     kind_fraction: tuple[float, float],
     seed: int = 42,
     batch_size: int = 128,
     *,
     train_marks: tuple[Mark, ...] | None = None,
+    frontload_known: bool = False,
     describe_datasets: bool = False,
 ) -> tuple[DataLoader, DataLoader]:
     train_dataset = MarkedMNIST(
@@ -173,9 +229,18 @@ def get_dataloaders(
         ]
         train_data = Subset(train_dataset, train_indices)
 
-    train_loader = DataLoader(
-        train_data, batch_size=batch_size, shuffle=True, num_workers=0
-    )
+    if frontload_known:
+        train_loader = DataLoader(
+            train_data,
+            batch_sampler=FrontloadedKnownBatchSampler(
+                train_data, batch_size=batch_size, seed=seed
+            ),
+            num_workers=0,
+        )
+    else:
+        train_loader = DataLoader(
+            train_data, batch_size=batch_size, shuffle=True, num_workers=0
+        )
     test_loader = DataLoader(
         test_dataset, batch_size=batch_size, shuffle=False, num_workers=0
     )

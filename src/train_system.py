@@ -638,10 +638,11 @@ def _create_experiment_dir() -> Path:
 
 def main() -> None:
     config = Config(
-        system_lr=1e-3,
-        system_epochs=2,
+        frontload_known=True,
+        system_lr=5e-4,
+        system_epochs=20,
         system_trainable=("gate", "safe"),
-        system_init_gate_path="gate_known.pt",
+        system_init_gate_path=None,
         system_init_safe_model="classifier_all/model.pt",
         system_init_unsafe_model="classifier_all/model.pt",
     )
@@ -662,6 +663,7 @@ def main() -> None:
         kind_fraction=config.kind_fraction,
         seed=config.seed,
         batch_size=config.classifier_batch_size,
+        frontload_known=config.frontload_known,
         describe_datasets=True,
     )
 

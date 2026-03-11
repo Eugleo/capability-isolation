@@ -12,6 +12,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from matplotlib.lines import Line2D
+from matplotlib.ticker import MaxNLocator
 from torch.utils.data import DataLoader
 
 from src.classifier import Classifier
@@ -28,7 +29,6 @@ KIND_GRID: list[list[Kind]] = [
 
 
 def classification_loss(probs_BC: torch.Tensor, labels_B: torch.Tensor) -> torch.Tensor:
-    """NLL on blended probabilities."""
     return nn.functional.nll_loss(torch.log(probs_BC.clamp(min=1e-8)), labels_B)
 
 
@@ -37,7 +37,6 @@ def gate_supervision_loss(
     is_known_B: torch.Tensor,
     is_marked_B: torch.Tensor,
 ) -> torch.Tensor:
-    """BCE loss on gate output, masked to known samples only."""
     target_B1 = is_marked_B.to(device=gate_B1.device, dtype=gate_B1.dtype).unsqueeze(1)
     mask_B1 = is_known_B.to(device=gate_B1.device, dtype=gate_B1.dtype).unsqueeze(1)
     bce = nn.functional.binary_cross_entropy(gate_B1, target_B1, reduction="none")
@@ -65,7 +64,6 @@ def _batch_kind_metrics(
     kinds: list[str],
     step: int,
 ) -> list[dict]:
-    """Per-kind classification losses and average gate value for one training batch."""
     with torch.no_grad():
         loss_safe_B = nn.functional.cross_entropy(
             output["safe_logits"], labels_B, reduction="none"
@@ -216,14 +214,6 @@ def plot_batch_kind_metrics(
     df: pl.DataFrame,
     save_path: Path | str,
 ) -> None:
-    """6-panel plot: per-kind losses and gate values over training steps.
-
-    Columns: none / left / right.  Rows: low / high.
-    Left y-axis: safe (green), unsafe (red), system (blue) classification loss.
-    Right y-axis: average gate value (black, 0-1).
-    Background: green where smoothed safe loss <= smoothed unsafe loss, red otherwise.
-    All series are smoothed with a rolling mean of SMOOTHING_WINDOW steps.
-    """
     if df.is_empty():
         return
 
@@ -277,6 +267,7 @@ def plot_batch_kind_metrics(
             ax.plot(steps, loss_system, color="blue", linewidth=0.7, alpha=0.85)
             ax.set_ylabel("Loss")
             ax.set_title(kind)
+            ax.xaxis.set_major_locator(MaxNLocator(integer=True))
             if row_idx == 1:
                 ax.set_xlabel("Step")
 
@@ -294,9 +285,78 @@ def plot_batch_kind_metrics(
     ]
     fig.legend(
         handles=legend_elements,
-        loc="upper center",
-        bbox_to_anchor=(0.5, 0.02),
+        loc="lower center",
+        bbox_to_anchor=(0.5, 0.01),
         ncol=4,
+        fontsize=9,
+    )
+    fig.tight_layout(rect=[0, 0.06, 1, 1])
+    fig.savefig(save_path, dpi=150)
+    plt.close(fig)
+
+
+def plot_batch_kind_diffs(
+    df: pl.DataFrame,
+    save_path: Path | str,
+) -> None:
+    if df.is_empty():
+        return
+
+    metric_cols = ["loss_safe", "loss_unsafe", "avg_gate"]
+
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10), sharex=True)
+
+    for row_idx, kind_row in enumerate(KIND_GRID):
+        for col_idx, kind in enumerate(kind_row):
+            ax = axes[row_idx, col_idx]
+            kind_df = (
+                df.filter(pl.col("kind") == kind)
+                .sort("step")
+                .with_columns(
+                    pl.col(c)
+                    .rolling_mean(window_size=SMOOTHING_WINDOW, min_periods=1)
+                    .alias(c)
+                    for c in metric_cols
+                )
+            )
+
+            if kind_df.is_empty():
+                ax.set_title(kind)
+                continue
+
+            steps = kind_df["step"].to_list()
+            loss_safe = kind_df["loss_safe"].to_list()
+            loss_unsafe = kind_df["loss_unsafe"].to_list()
+            avg_gate = kind_df["avg_gate"].to_list()
+
+            loss_diff = [s - u for s, u in zip(loss_safe, loss_unsafe)]
+
+            ax.axhline(0, color="gray", linewidth=0.5, linestyle="--", alpha=0.5)
+            ax.plot(steps, loss_diff, color="#377eb8", linewidth=0.7, alpha=0.85)
+            ax.set_ylabel("safe loss − unsafe loss")
+            ax.set_title(kind)
+            ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+            if row_idx == 1:
+                ax.set_xlabel("Step")
+
+            ax2 = ax.twinx()
+            ax2.plot(steps, avg_gate, color="black", linewidth=0.7, alpha=0.85)
+            ax2.set_ylim(0, 1)
+            if col_idx == 2:
+                ax2.set_ylabel("Gate")
+
+    legend_elements = [
+        Line2D([0], [0], color="#377eb8", label="safe loss − unsafe loss"),
+        Line2D(
+            [0], [0], color="gray", linestyle="--", linewidth=0.5, label="zero line"
+        ),
+        Line2D([0], [0], color="black", label="gate value"),
+    ]
+    fig.legend(
+        handles=legend_elements,
+        loc="lower center",
+        bbox_to_anchor=(0.5, 0.01),
+        ncol=3,
         fontsize=9,
     )
     fig.tight_layout(rect=[0, 0.06, 1, 1])
@@ -321,7 +381,6 @@ def plot_aggregate_metrics(
     history: list[dict[str, float]],
     save_path: Path | str,
 ) -> None:
-    """3-panel plot: overall, unmarked, marked accuracy over epochs."""
     if not history:
         return
 
@@ -356,13 +415,14 @@ def plot_aggregate_metrics(
         ax.set_ylabel("Accuracy")
         ax.set_title(title)
         ax.set_ylim(0, 1)
+        ax.xaxis.set_major_locator(MaxNLocator(integer=True))
         ax.grid(True, alpha=0.3)
 
     fig.legend(
         legend_handles.values(),
         legend_handles.keys(),
-        loc="upper center",
-        bbox_to_anchor=(0.5, 0.02),
+        loc="lower center",
+        bbox_to_anchor=(0.5, 0.01),
         ncol=3,
         fontsize=9,
     )
@@ -375,7 +435,6 @@ def plot_kind_metrics(
     history: list[dict[str, float]],
     save_path: Path | str,
 ) -> None:
-    """6-panel plot (2x3): per-kind accuracy. Columns: none/left/right, rows: low/high."""
     if not history:
         return
 
@@ -407,13 +466,14 @@ def plot_kind_metrics(
             ax.set_ylabel("Accuracy")
             ax.set_title(kind)
             ax.set_ylim(0, 1)
+            ax.xaxis.set_major_locator(MaxNLocator(integer=True))
             ax.grid(True, alpha=0.3)
 
     fig.legend(
         legend_handles.values(),
         legend_handles.keys(),
-        loc="upper center",
-        bbox_to_anchor=(0.5, 0.02),
+        loc="lower center",
+        bbox_to_anchor=(0.5, 0.01),
         ncol=3,
         fontsize=9,
     )
@@ -423,7 +483,6 @@ def plot_kind_metrics(
 
 
 def _create_experiment_dir() -> Path:
-    """Create a unique experiment folder and return its path."""
     experiments_root = Path("experiments")
     experiments_root.mkdir(exist_ok=True)
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -495,6 +554,9 @@ def main() -> None:
     print(
         f"Saved batch kind metrics plot to {experiment_dir / 'batch_kind_metrics.png'}"
     )
+
+    plot_batch_kind_diffs(batch_metrics_df, experiment_dir / "batch_kind_diffs.png")
+    print(f"Saved batch kind diffs plot to {experiment_dir / 'batch_kind_diffs.png'}")
 
     gate_metrics = evaluate_gate(system.gate, test_loader, device)
     system_metrics = evaluate_gated_system(system, test_loader, device)

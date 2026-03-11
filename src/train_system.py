@@ -28,6 +28,13 @@ KIND_GRID: list[list[Kind]] = [
 ]
 
 
+def style_kind_panel(ax, kind: Kind) -> None:
+    border_color = "#ff7f00" if kind.endswith("-k") else "black"
+    for spine in ax.spines.values():
+        spine.set_color(border_color)
+        spine.set_linewidth(1.5)
+
+
 def classification_loss(probs_BC: torch.Tensor, labels_B: torch.Tensor) -> torch.Tensor:
     return nn.functional.nll_loss(torch.log(probs_BC.clamp(min=1e-8)), labels_B)
 
@@ -261,6 +268,7 @@ def plot_batch_kind_metrics(
     for row_idx, kind_row in enumerate(KIND_GRID):
         for col_idx, kind in enumerate(kind_row):
             ax = axes[row_idx, col_idx]
+            style_kind_panel(ax, kind)
             kind_loss_df = (
                 loss_df.filter(pl.col("kind") == kind)
                 .sort("step")
@@ -318,6 +326,7 @@ def plot_batch_kind_metrics(
                 ax.set_xlabel("Step")
 
             ax2 = ax.twinx()
+            style_kind_panel(ax2, kind)
             ax2.plot(steps, avg_gate, color="black", linewidth=0.7, alpha=0.85)
             ax2.set_ylim(0, 1)
             if col_idx == 2:
@@ -356,6 +365,7 @@ def plot_batch_kind_diffs(
     for row_idx, kind_row in enumerate(KIND_GRID):
         for col_idx, kind in enumerate(kind_row):
             ax = axes[row_idx, col_idx]
+            style_kind_panel(ax, kind)
             kind_loss_df = (
                 loss_df.filter(pl.col("kind") == kind)
                 .sort("step")
@@ -396,6 +406,7 @@ def plot_batch_kind_diffs(
                 ax.set_xlabel("Step")
 
             ax2 = ax.twinx()
+            style_kind_panel(ax2, kind)
             ax2.plot(steps, avg_gate, color="black", linewidth=0.7, alpha=0.85)
             ax2.set_ylim(0, 1)
             if col_idx == 2:
@@ -583,6 +594,7 @@ def plot_kind_metrics(
     for row_idx, kind_row in enumerate(KIND_GRID):
         for col_idx, kind in enumerate(kind_row):
             ax = axes[row_idx, col_idx]
+            style_kind_panel(ax, kind)
             for mode, prefix in [
                 ("system", "system"),
                 ("safe only", "system_safe"),

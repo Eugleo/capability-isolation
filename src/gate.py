@@ -1,12 +1,11 @@
-import math
-from typing import Literal
+from typing import get_args
 
+import polars as pl
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-Kind = Literal["unmarked", "left", "right"]
-KindLabel = Literal["unknown", "unmarked", "left", "right"]
+from src.data import Kind
 
 
 class Gate(nn.Module):
@@ -31,160 +30,65 @@ class Gate(nn.Module):
         return torch.sigmoid(self.fc(h))
 
 
+GATE_KINDS: tuple[Kind, ...] = get_args(Kind)
+
+
+def _build_gate_metric_frame(
+    gate: nn.Module,
+    dataset: DataLoader,
+    device: torch.device,
+) -> pl.DataFrame:
+    rows: list[dict[str, str | bool]] = []
+
+    gate.eval()
+    with torch.no_grad():
+        for batch in dataset:
+            images = batch["image"].to(device)
+            is_marked = batch["is_marked"].to(device=device, dtype=torch.bool)
+            kinds = list(batch["kind"])
+
+            pred_marked = (gate(images) >= 0.5).squeeze(1)
+            correct_list = pred_marked.eq(is_marked).cpu().tolist()
+
+            for correct, kind in zip(correct_list, kinds, strict=True):
+                rows.append({"item_kind": str(kind), "correct": bool(correct)})
+
+    sample_df = pl.DataFrame(rows)
+    if sample_df.is_empty():
+        return pl.DataFrame(
+            {
+                "item_kind": list(GATE_KINDS),
+                "count": [0] * len(GATE_KINDS),
+                "accuracy": [float("nan")] * len(GATE_KINDS),
+            }
+        )
+
+    metric_df = sample_df.group_by("item_kind").agg(
+        pl.len().alias("count"),
+        pl.col("correct").mean().alias("accuracy"),
+    )
+    all_kinds_df = pl.DataFrame({"item_kind": list(GATE_KINDS)})
+    return (
+        all_kinds_df.join(metric_df, on="item_kind", how="left")
+        .with_columns(
+            pl.col("count").fill_null(0),
+            pl.col("accuracy").cast(pl.Float64).fill_null(float("nan")),
+        )
+        .sort("item_kind")
+    )
+
+
 def evaluate_gate(
-    gate: Gate,
+    gate: nn.Module,
     dataset: DataLoader,
     device: torch.device,
 ) -> dict[str, float]:
-    gate.eval()
-    criterion = nn.BCELoss()
+    metric_df = _build_gate_metric_frame(gate, dataset, device)
+    metrics: dict[str, float] = {}
 
-    def _acc(c: float, t: float) -> float:
-        return c / t if t > 0 else math.nan
+    for row in metric_df.iter_rows(named=True):
+        item_kind = str(row["item_kind"])
+        metrics[f"gate/{item_kind}/accuracy"] = float(row["accuracy"])
+        metrics[f"gate/{item_kind}/count"] = float(row["count"])
 
-    counts = {
-        "all": (0.0, 0.0),
-        "unmarked": (0.0, 0.0),
-        "unmarked/known": (0.0, 0.0),
-        "unmarked/unknown": (0.0, 0.0),
-        "marked": (0.0, 0.0),
-        "marked/known": (0.0, 0.0),
-        "marked/known/left": (0.0, 0.0),
-        "marked/known/right": (0.0, 0.0),
-        "marked/unknown": (0.0, 0.0),
-        "marked/unknown/left": (0.0, 0.0),
-        "marked/unknown/right": (0.0, 0.0),
-    }
-    bc_loss_sum = 0.0
-    bc_loss_count = 0.0
-    tp_total = 0.0
-    fp_total = 0.0
-    fn_total = 0.0
-
-    with torch.no_grad():
-        for batch in dataset:
-            images_BCHW, _, kinds, kind_labels = batch
-            images_BCHW = images_BCHW.to(device)
-            batch_size = len(images_BCHW)
-
-            gate_out_B1 = gate(images_BCHW)
-            pred_marked_B = (gate_out_B1 >= 0.5).squeeze(1)
-            pred_unmarked_B = ~pred_marked_B
-
-            targets_B1 = torch.tensor(
-                [1.0 if k != "unmarked" else 0.0 for k in kinds],
-                device=device,
-                dtype=gate_out_B1.dtype,
-            ).unsqueeze(1)
-            bc_loss_sum += criterion(gate_out_B1, targets_B1).item() * batch_size
-            bc_loss_count += batch_size
-
-            is_unmarked_B = torch.tensor(
-                [k == "unmarked" for k in kinds], device=device
-            ).float()
-            is_marked_B = 1.0 - is_unmarked_B
-            is_unmarked_known_B = torch.tensor(
-                [
-                    k == "unmarked" and kl == "unmarked"
-                    for k, kl in zip(kinds, kind_labels)
-                ],
-                device=device,
-            ).float()
-            is_unmarked_unknown_B = torch.tensor(
-                [
-                    k == "unmarked" and kl == "unknown"
-                    for k, kl in zip(kinds, kind_labels)
-                ],
-                device=device,
-            ).float()
-            is_known_marked_B = torch.tensor(
-                [
-                    k != "unmarked" and kl != "unknown"
-                    for k, kl in zip(kinds, kind_labels)
-                ],
-                device=device,
-            ).float()
-            is_unknown_marked_B = torch.tensor(
-                [
-                    k != "unmarked" and kl == "unknown"
-                    for k, kl in zip(kinds, kind_labels)
-                ],
-                device=device,
-            ).float()
-            is_known_left_B = torch.tensor(
-                [k == "left" and kl == "left" for k, kl in zip(kinds, kind_labels)],
-                device=device,
-            ).float()
-            is_known_right_B = torch.tensor(
-                [k == "right" and kl == "right" for k, kl in zip(kinds, kind_labels)],
-                device=device,
-            ).float()
-            is_unknown_left_B = torch.tensor(
-                [k == "left" and kl == "unknown" for k, kl in zip(kinds, kind_labels)],
-                device=device,
-            ).float()
-            is_unknown_right_B = torch.tensor(
-                [k == "right" and kl == "unknown" for k, kl in zip(kinds, kind_labels)],
-                device=device,
-            ).float()
-
-            is_marked_bool = is_marked_B > 0.5
-            tp_total += (pred_marked_B & is_marked_bool).sum().item()
-            fp_total += (pred_marked_B & ~is_marked_bool).sum().item()
-            fn_total += (pred_unmarked_B & is_marked_bool).sum().item()
-
-            correct_all_B = (pred_marked_B == is_marked_bool).float()
-            correct_unmarked_B = pred_unmarked_B.float()
-            correct_marked_B = pred_marked_B.float()
-
-            def _update(
-                updates: list[tuple[str, torch.Tensor, torch.Tensor]],
-            ) -> None:
-                for name, correct_B, mask_B in updates:
-                    old_c, old_t = counts[name]
-                    counts[name] = (
-                        old_c + (correct_B * mask_B).sum().item(),
-                        old_t + mask_B.sum().item(),
-                    )
-
-            _update(
-                [
-                    ("all", correct_all_B, torch.ones(batch_size, device=device)),
-                    ("unmarked", correct_unmarked_B, is_unmarked_B),
-                    ("unmarked/known", correct_unmarked_B, is_unmarked_known_B),
-                    ("unmarked/unknown", correct_unmarked_B, is_unmarked_unknown_B),
-                    ("marked", correct_marked_B, is_marked_B),
-                    ("marked/known", correct_marked_B, is_known_marked_B),
-                    ("marked/known/left", correct_marked_B, is_known_left_B),
-                    ("marked/known/right", correct_marked_B, is_known_right_B),
-                    ("marked/unknown", correct_marked_B, is_unknown_marked_B),
-                    ("marked/unknown/left", correct_marked_B, is_unknown_left_B),
-                    ("marked/unknown/right", correct_marked_B, is_unknown_right_B),
-                ]
-            )
-
-    bc_loss = bc_loss_sum / bc_loss_count if bc_loss_count > 0 else math.nan
-    precision = (
-        tp_total / (tp_total + fp_total) if (tp_total + fp_total) > 0 else math.nan
-    )
-    recall = tp_total / (tp_total + fn_total) if (tp_total + fn_total) > 0 else math.nan
-
-    all_metrics: dict[str, float] = {}
-    for name in counts:
-        c, t = counts[name]
-        all_metrics[f"gate/{name}/accuracy"] = _acc(c, t)
-    all_metrics["gate/marked/precision"] = precision
-    all_metrics["gate/marked/recall"] = recall
-    all_metrics["gate/bc_loss"] = bc_loss
-
-    priority_metrics = [
-        "gate/unmarked/accuracy",
-        "gate/marked/known/left/accuracy",
-        "gate/marked/unknown/right/accuracy",
-    ]
-    result: dict[str, float] = {}
-    for key in priority_metrics:
-        if key in all_metrics:
-            result[f"@/{key}"] = all_metrics.pop(key)
-    result.update(all_metrics)
-    return result
+    return metrics

@@ -5,54 +5,43 @@ import uuid
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
-from typing import Literal
 
 import matplotlib.pyplot as plt
+import polars as pl
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from matplotlib.lines import Line2D
 from torch.utils.data import DataLoader
 
 from src.classifier import Classifier
 from src.config import Config
-from src.data import get_dataloaders
+from src.data import Kind, get_dataloaders
 from src.gate import Gate, evaluate_gate
 from src.system import GatedSystem, evaluate_gated_system
 from src.utils import format_metric_value, get_device, set_seed
 
+KIND_GRID: list[list[Kind]] = [
+    ["none-low-k", "left-low-k", "right-low-u"],
+    ["none-high-u", "left-high-u", "right-high-u"],
+]
 
-def classification_loss(probs: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-    """Classification loss on blended probs (NLL)."""
-    return nn.functional.nll_loss(torch.log(probs.clamp(min=1e-8)), labels)
+
+def classification_loss(probs_BC: torch.Tensor, labels_B: torch.Tensor) -> torch.Tensor:
+    """NLL on blended probabilities."""
+    return nn.functional.nll_loss(torch.log(probs_BC.clamp(min=1e-8)), labels_B)
 
 
 def gate_supervision_loss(
-    gate_values: torch.Tensor,
-    kind_labels: list[Literal["unknown", "unmarked", "left", "right"]],
-    device: torch.device,
+    gate_B1: torch.Tensor,
+    is_known_B: torch.Tensor,
+    is_marked_B: torch.Tensor,
 ) -> torch.Tensor:
-    targets = []
-    mask = []
-
-    for kl in kind_labels:
-        if kl == "unmarked":
-            targets.append(0.0)
-            mask.append(1.0)
-        elif kl in ("left", "right"):
-            targets.append(1.0)
-            mask.append(1.0)
-        else:  # unknown
-            targets.append(0.0)  # dummy, masked
-            mask.append(0.0)
-
-    targets_t = torch.tensor(targets, device=device, dtype=gate_values.dtype).unsqueeze(
-        1
-    )
-    mask_t = torch.tensor(mask, device=device, dtype=gate_values.dtype).unsqueeze(1)
-
-    bce = nn.functional.binary_cross_entropy(gate_values, targets_t, reduction="none")
-    masked_loss = (bce * mask_t).sum() / (mask_t.sum() + 1e-8)
-    return masked_loss
+    """BCE loss on gate output, masked to known samples only."""
+    target_B1 = is_marked_B.to(device=gate_B1.device, dtype=gate_B1.dtype).unsqueeze(1)
+    mask_B1 = is_known_B.to(device=gate_B1.device, dtype=gate_B1.dtype).unsqueeze(1)
+    bce = nn.functional.binary_cross_entropy(gate_B1, target_B1, reduction="none")
+    return (bce * mask_B1).sum() / (mask_B1.sum() + 1e-8)
 
 
 def divergence_loss(model_safe: nn.Module, model_unsafe: nn.Module) -> torch.Tensor:
@@ -70,56 +59,43 @@ def divergence_loss(model_safe: nn.Module, model_unsafe: nn.Module) -> torch.Ten
     return -l2_distance
 
 
-EXAMPLE_TYPES = [
-    "unknown-left",
-    "unknown-right",
-    "unknown-unmarked",
-    "known-left",
-    "known-right",
-    "known-unmarked",
-]
-
-
-def _avg_gate_per_type(
-    gate_values_B1: torch.Tensor,
+def _batch_kind_metrics(
+    output: dict[str, torch.Tensor],
+    labels_B: torch.Tensor,
     kinds: list[str],
-    kind_labels: list[str],
-    device: torch.device,
-) -> dict[str, float]:
-    """Compute average gate value for each example type in the batch."""
-    gate_B = gate_values_B1.squeeze(1).detach()
-    result: dict[str, float] = {}
+    step: int,
+) -> list[dict]:
+    """Per-kind classification losses and average gate value for one training batch."""
+    with torch.no_grad():
+        loss_safe_B = nn.functional.cross_entropy(
+            output["safe_logits"], labels_B, reduction="none"
+        )
+        loss_unsafe_B = nn.functional.cross_entropy(
+            output["unsafe_logits"], labels_B, reduction="none"
+        )
+        log_probs = torch.log(output["prediction"].clamp(min=1e-8))
+        loss_system_B = nn.functional.nll_loss(log_probs, labels_B, reduction="none")
+        gate_B = output["gate"].squeeze(1)
 
-    masks = {
-        "unknown-left": [
-            (kl == "unknown" and k == "left") for k, kl in zip(kinds, kind_labels)
-        ],
-        "unknown-right": [
-            (kl == "unknown" and k == "right") for k, kl in zip(kinds, kind_labels)
-        ],
-        "unknown-unmarked": [
-            (kl == "unknown" and k == "unmarked") for k, kl in zip(kinds, kind_labels)
-        ],
-        "known-left": [
-            (kl == "left" and k == "left") for k, kl in zip(kinds, kind_labels)
-        ],
-        "known-right": [
-            (kl == "right" and k == "right") for k, kl in zip(kinds, kind_labels)
-        ],
-        "known-unmarked": [
-            (kl == "unmarked" and k == "unmarked") for k, kl in zip(kinds, kind_labels)
-        ],
-    }
+    kind_to_idx: dict[str, list[int]] = {}
+    for i, k in enumerate(kinds):
+        kind_to_idx.setdefault(k, []).append(i)
 
-    for name, mask_list in masks.items():
-        mask_B = torch.tensor(mask_list, device=device, dtype=gate_B.dtype)
-        n = mask_B.sum().item()
-        if n > 0:
-            result[name] = (gate_B * mask_B).sum().item() / n
-        else:
-            result[name] = math.nan
-
-    return result
+    rows: list[dict] = []
+    for kind, idxs in kind_to_idx.items():
+        t = torch.tensor(idxs, device=labels_B.device)
+        rows.append(
+            {
+                "step": step,
+                "kind": kind,
+                "loss_safe": loss_safe_B[t].mean().item(),
+                "loss_unsafe": loss_unsafe_B[t].mean().item(),
+                "loss_system": loss_system_B[t].mean().item(),
+                "avg_gate": gate_B[t].mean().item(),
+                "count": len(idxs),
+            }
+        )
+    return rows
 
 
 def train_system(
@@ -128,7 +104,7 @@ def train_system(
     train_loader: DataLoader,
     test_loader: DataLoader,
     system: GatedSystem,
-) -> tuple[GatedSystem, list[dict[str, float]], list[dict[str, float]]]:
+) -> tuple[GatedSystem, pl.DataFrame, list[dict[str, float]]]:
     trainable = set(config.system_trainable)
     for p in system.gate.parameters():
         p.requires_grad = "gate" in trainable
@@ -150,7 +126,7 @@ def train_system(
     w_gate = config.system_gate_weight
     w_div = config.system_divergence_weight
 
-    gate_history: list[dict[str, float]] = []
+    batch_metrics_rows: list[dict] = []
     epoch_eval_history: list[dict[str, float]] = []
     step = 0
 
@@ -178,16 +154,18 @@ def train_system(
         n_samples = 0
 
         for batch in train_loader:
-            images_BCHW, labels_B, kinds, kind_labels = batch
-            images_BCHW = images_BCHW.to(device)
-            labels_B = labels_B.to(device)
+            images_BCHW = batch["image"].to(device)
+            labels_B = batch["label"].to(device)
+            kinds = list(batch["kind"])
+            is_known_B = batch["is_known"]
+            is_marked_B = batch["is_marked"]
 
             optimizer.zero_grad()
 
-            probs_BC, gate_computed_B1, _ = system(images_BCHW, kind_labels=kind_labels)
+            output = system(images_BCHW)
 
-            L_cls = classification_loss(probs_BC, labels_B)
-            L_gate = gate_supervision_loss(gate_computed_B1, kind_labels, device)
+            L_cls = classification_loss(output["prediction"], labels_B)
+            L_gate = gate_supervision_loss(output["gate"], is_known_B, is_marked_B)
             L_div = divergence_loss(system.model_safe, system.model_unsafe)
 
             loss = w_cls * L_cls + w_gate * L_gate + w_div * L_div
@@ -197,9 +175,9 @@ def train_system(
             total_loss += loss.item() * len(images_BCHW)
             n_samples += len(images_BCHW)
 
-            # Store average gate value per example type for this batch
-            avg_gates = _avg_gate_per_type(gate_computed_B1, kinds, kind_labels, device)
-            gate_history.append({"step": step, **avg_gates})
+            batch_metrics_rows.extend(
+                _batch_kind_metrics(output, labels_B, kinds, step)
+            )
             step += 1
 
         avg_loss = total_loss / n_samples if n_samples > 0 else 0.0
@@ -228,41 +206,100 @@ def train_system(
             }
         )
 
-    return system, gate_history, epoch_eval_history
+    return system, pl.DataFrame(batch_metrics_rows), epoch_eval_history
 
 
-def plot_gate_history(
-    gate_history: list[dict[str, float]],
+SMOOTHING_WINDOW = 15
+
+
+def plot_batch_kind_metrics(
+    df: pl.DataFrame,
     save_path: Path | str,
 ) -> None:
-    """Plot average gate values per example type over training steps."""
-    if not gate_history:
+    """6-panel plot: per-kind losses and gate values over training steps.
+
+    Columns: none / left / right.  Rows: low / high.
+    Left y-axis: safe (green), unsafe (red), system (blue) classification loss.
+    Right y-axis: average gate value (black, 0-1).
+    Background: green where smoothed safe loss <= smoothed unsafe loss, red otherwise.
+    All series are smoothed with a rolling mean of SMOOTHING_WINDOW steps.
+    """
+    if df.is_empty():
         return
 
-    steps = [h["step"] for h in gate_history]
-    # right=red, left=purple, unmarked=green
-    kind_colors = {"right": "#e41a1c", "left": "#984ea3", "unmarked": "#4daf4a"}
-    # unknown=dashed, known=solid
-    known_linestyles = {"unknown": "dashed", "known": "solid"}
+    metric_cols = ["loss_safe", "loss_unsafe", "loss_system", "avg_gate"]
 
-    fig, ax = plt.subplots(figsize=(10, 6))
-    for etype in EXAMPLE_TYPES:
-        known_or_unknown, kind = etype.split("-")
-        values = [h[etype] for h in gate_history]
-        ax.plot(
-            steps,
-            values,
-            label=etype,
-            color=kind_colors[kind],
-            linestyle=known_linestyles[known_or_unknown],
-        )
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10), sharex=True)
 
-    ax.set_xlabel("Training step")
-    ax.set_ylabel("Gate value")
-    ax.set_ylim(0, 1)
-    ax.legend(loc="best", fontsize=9)
-    ax.grid(True, alpha=0.3)
-    fig.tight_layout()
+    for row_idx, kind_row in enumerate(KIND_GRID):
+        for col_idx, kind in enumerate(kind_row):
+            ax = axes[row_idx, col_idx]
+            kind_df = (
+                df.filter(pl.col("kind") == kind)
+                .sort("step")
+                .with_columns(
+                    pl.col(c)
+                    .rolling_mean(window_size=SMOOTHING_WINDOW, min_periods=1)
+                    .alias(c)
+                    for c in metric_cols
+                )
+            )
+
+            if kind_df.is_empty():
+                ax.set_title(kind)
+                continue
+
+            steps = kind_df["step"].to_list()
+            loss_safe = kind_df["loss_safe"].to_list()
+            loss_unsafe = kind_df["loss_unsafe"].to_list()
+            loss_system = kind_df["loss_system"].to_list()
+            avg_gate = kind_df["avg_gate"].to_list()
+
+            # Background spans (merge consecutive same-color regions)
+            spans: list[tuple[float, float, str]] = []
+            for i in range(len(steps)):
+                left = steps[0] - 0.5 if i == 0 else (steps[i - 1] + steps[i]) / 2
+                right = (
+                    steps[-1] + 0.5
+                    if i == len(steps) - 1
+                    else (steps[i] + steps[i + 1]) / 2
+                )
+                color = "green" if loss_safe[i] <= loss_unsafe[i] else "red"
+                if spans and spans[-1][2] == color:
+                    spans[-1] = (spans[-1][0], right, color)
+                else:
+                    spans.append((left, right, color))
+            for left, right, color in spans:
+                ax.axvspan(left, right, color=color, alpha=0.07)
+
+            ax.plot(steps, loss_safe, color="green", linewidth=0.7, alpha=0.85)
+            ax.plot(steps, loss_unsafe, color="red", linewidth=0.7, alpha=0.85)
+            ax.plot(steps, loss_system, color="blue", linewidth=0.7, alpha=0.85)
+            ax.set_ylabel("Loss")
+            ax.set_title(kind)
+            if row_idx == 1:
+                ax.set_xlabel("Step")
+
+            ax2 = ax.twinx()
+            ax2.plot(steps, avg_gate, color="black", linewidth=0.7, alpha=0.85)
+            ax2.set_ylim(0, 1)
+            if col_idx == 2:
+                ax2.set_ylabel("Gate")
+
+    legend_elements = [
+        Line2D([0], [0], color="green", label="safe loss"),
+        Line2D([0], [0], color="red", label="unsafe loss"),
+        Line2D([0], [0], color="blue", label="system loss"),
+        Line2D([0], [0], color="black", label="gate value"),
+    ]
+    fig.legend(
+        handles=legend_elements,
+        loc="upper center",
+        bbox_to_anchor=(0.5, 0.02),
+        ncol=4,
+        fontsize=9,
+    )
+    fig.tight_layout(rect=[0, 0.06, 1, 1])
     fig.savefig(save_path, dpi=150)
     plt.close(fig)
 
@@ -280,59 +317,39 @@ def _merge_metrics(*metric_dicts: dict[str, float]) -> dict[str, float]:
     return merged
 
 
-def plot_system_comparison(
-    trained_history: list[dict[str, float]],
+def plot_aggregate_metrics(
+    history: list[dict[str, float]],
     save_path: Path | str,
 ) -> None:
-    """Plot system, safe-only, and unsafe-only accuracy over epochs plus gate P/R."""
-    if not trained_history:
+    """3-panel plot: overall, unmarked, marked accuracy over epochs."""
+    if not history:
         return
 
-    fig, axes = plt.subplots(2, 4, figsize=(16, 8))
-
+    epochs = [entry["epoch"] for entry in history]
     color_map = {
         "system": "#377eb8",
         "safe only": "#4daf4a",
         "unsafe only": "#e41a1c",
     }
-    legend_handles: dict[str, plt.Artist] = {}
-    epochs = [entry["epoch"] for entry in trained_history]
-
-    metric_panels = [
-        ("system/all/accuracy", "Overall"),
-        ("system/unmarked/unknown/accuracy", "Unknown unmarked"),
-        ("system/unmarked/known/accuracy", "Known unmarked"),
-        ("system/marked/known/left/accuracy", "Known marked left"),
-        ("system/marked/unknown/right/accuracy", "Unknown marked right"),
-        ("system/marked/accuracy", "Marked"),
-        ("system/unmarked/accuracy", "Unmarked"),
+    panels = [
+        ("Overall", "all"),
+        ("Unmarked", "unmarked"),
+        ("Marked", "marked"),
     ]
 
-    for ax, (base_metric, title) in zip(
-        [
-            axes[0, 0],
-            axes[0, 1],
-            axes[0, 2],
-            axes[0, 3],
-            axes[1, 0],
-            axes[1, 1],
-            axes[1, 2],
-        ],
-        metric_panels,
-    ):
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5), sharey=True)
+    legend_handles: dict[str, plt.Artist] = {}
+
+    for ax, (title, agg_key) in zip(axes, panels):
         for mode, prefix in [
             ("system", "system"),
             ("safe only", "system_safe"),
             ("unsafe only", "system_unsafe"),
         ]:
-            metric = base_metric.replace("system/", f"{prefix}/", 1)
-            values = [entry.get(metric, 0.0) for entry in trained_history]
+            metric = f"{prefix}/{agg_key}/accuracy"
+            values = [entry.get(metric, 0.0) for entry in history]
             (line,) = ax.plot(
-                epochs,
-                values,
-                label=mode,
-                color=color_map[mode],
-                marker="o",
+                epochs, values, label=mode, color=color_map[mode], marker="o"
             )
             legend_handles.setdefault(mode, line)
         ax.set_xlabel("Epoch")
@@ -341,50 +358,66 @@ def plot_system_comparison(
         ax.set_ylim(0, 1)
         ax.grid(True, alpha=0.3)
 
-    ax = axes[1, 3]
-    recalls = [entry.get("gate/marked/recall", 0.0) for entry in trained_history]
-    precisions = [entry.get("gate/marked/precision", 0.0) for entry in trained_history]
-    (pr_line,) = ax.plot(
-        recalls,
-        precisions,
-        color=color_map["system"],
-        label="gate",
-    )
-    legend_handles["gate"] = pr_line
-    denom = max(len(trained_history) - 1, 1)
-    for idx, (recall, precision) in enumerate(zip(recalls, precisions)):
-        alpha = 0.25 + 0.75 * (idx / denom)
-        ax.scatter(
-            recall,
-            precision,
-            color=color_map["system"],
-            s=100,
-            alpha=alpha,
-            zorder=5,
-        )
-    ax.set_xlabel("Gate recall")
-    ax.set_ylabel("Gate precision")
-    ax.set_title("Gate precision vs recall")
-    ax.set_xlim(0, 1)
-    ax.set_ylim(0, 1)
-    ax.grid(True, alpha=0.3)
-    ax.text(
-        0.03,
-        0.03,
-        "Darker points are later epochs.",
-        transform=ax.transAxes,
+    fig.legend(
+        legend_handles.values(),
+        legend_handles.keys(),
+        loc="upper center",
+        bbox_to_anchor=(0.5, 0.02),
+        ncol=3,
         fontsize=9,
     )
+    fig.tight_layout(rect=[0, 0.08, 1, 1])
+    fig.savefig(save_path, dpi=150)
+    plt.close(fig)
+
+
+def plot_kind_metrics(
+    history: list[dict[str, float]],
+    save_path: Path | str,
+) -> None:
+    """6-panel plot (2x3): per-kind accuracy. Columns: none/left/right, rows: low/high."""
+    if not history:
+        return
+
+    epochs = [entry["epoch"] for entry in history]
+    color_map = {
+        "system": "#377eb8",
+        "safe only": "#4daf4a",
+        "unsafe only": "#e41a1c",
+    }
+
+    fig, axes = plt.subplots(2, 3, figsize=(15, 8), sharex=True, sharey=True)
+    legend_handles: dict[str, plt.Artist] = {}
+
+    for row_idx, kind_row in enumerate(KIND_GRID):
+        for col_idx, kind in enumerate(kind_row):
+            ax = axes[row_idx, col_idx]
+            for mode, prefix in [
+                ("system", "system"),
+                ("safe only", "system_safe"),
+                ("unsafe only", "system_unsafe"),
+            ]:
+                metric = f"{prefix}/{kind}/accuracy"
+                values = [entry.get(metric, 0.0) for entry in history]
+                (line,) = ax.plot(
+                    epochs, values, label=mode, color=color_map[mode], marker="o"
+                )
+                legend_handles.setdefault(mode, line)
+            ax.set_xlabel("Epoch")
+            ax.set_ylabel("Accuracy")
+            ax.set_title(kind)
+            ax.set_ylim(0, 1)
+            ax.grid(True, alpha=0.3)
 
     fig.legend(
         legend_handles.values(),
         legend_handles.keys(),
         loc="upper center",
         bbox_to_anchor=(0.5, 0.02),
-        ncol=4,
+        ncol=3,
         fontsize=9,
     )
-    fig.tight_layout(rect=[0, 0.06, 1, 1])
+    fig.tight_layout(rect=[0, 0.08, 1, 1])
     fig.savefig(save_path, dpi=150)
     plt.close(fig)
 
@@ -403,7 +436,7 @@ def _create_experiment_dir() -> Path:
 def main() -> None:
     config = Config(
         system_lr=3e-4,
-        system_epochs=15,
+        system_epochs=2,
         system_trainable=("gate", "safe"),
         system_init_gate_path="gate_known.pt",
         system_init_safe_model="classifier_all/model.pt",
@@ -451,12 +484,17 @@ def main() -> None:
     print("\n" + "=" * 60)
     print("Training system (gate + safe model)")
     print("=" * 60)
-    system, gate_history, epoch_eval_history = train_system(
+    system, batch_metrics_df, epoch_eval_history = train_system(
         config, device, train_loader, test_loader, system
     )
 
-    plot_gate_history(gate_history, experiment_dir / "gate_history.png")
-    print(f"Saved gate history plot to {experiment_dir / 'gate_history.png'}")
+    batch_metrics_df.write_csv(experiment_dir / "batch_kind_metrics.csv")
+    print(f"Saved batch metrics to {experiment_dir / 'batch_kind_metrics.csv'}")
+
+    plot_batch_kind_metrics(batch_metrics_df, experiment_dir / "batch_kind_metrics.png")
+    print(
+        f"Saved batch kind metrics plot to {experiment_dir / 'batch_kind_metrics.png'}"
+    )
 
     gate_metrics = evaluate_gate(system.gate, test_loader, device)
     system_metrics = evaluate_gated_system(system, test_loader, device)
@@ -467,11 +505,17 @@ def main() -> None:
     for key, value in system_metrics.items():
         print(f"  {key}: {format_metric_value(key, value)}")
 
-    plot_system_comparison(
+    plot_aggregate_metrics(
         epoch_eval_history,
-        save_path=experiment_dir / "system_comparison.png",
+        save_path=experiment_dir / "aggregate_metrics.png",
     )
-    print(f"Saved system comparison plot to {experiment_dir / 'system_comparison.png'}")
+    print(f"Saved aggregate metrics plot to {experiment_dir / 'aggregate_metrics.png'}")
+
+    plot_kind_metrics(
+        epoch_eval_history,
+        save_path=experiment_dir / "kind_metrics.png",
+    )
+    print(f"Saved kind metrics plot to {experiment_dir / 'kind_metrics.png'}")
 
     system.save(
         experiment_dir / "system.pt",

@@ -1,16 +1,24 @@
 import math
 from pathlib import Path
-from typing import Literal, Optional
+from typing import Optional, TypedDict, get_args
 
+import polars as pl
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
 from src.classifier import Classifier
-from src.config import Config
-from src.data import get_dataloaders
+from src.data import Kind
 from src.gate import Gate
-from src.utils import format_metric_value, get_device, set_seed
+
+SYSTEM_KINDS: tuple[Kind, ...] = get_args(Kind)
+
+
+class GatedSystemOutput(TypedDict):
+    prediction: torch.Tensor
+    safe_logits: torch.Tensor
+    unsafe_logits: torch.Tensor
+    gate: torch.Tensor
 
 
 class GatedSystem(nn.Module):
@@ -63,47 +71,96 @@ class GatedSystem(nn.Module):
             model_unsafe = model_unsafe.to(device)
         return cls(gate=gate, model_safe=model_safe, model_unsafe=model_unsafe)
 
-    def forward(
-        self,
-        images_BCHW: torch.Tensor,
-        kind_labels: Optional[
-            list[Literal["unknown", "unmarked", "left", "right"]]
-        ] = None,
-        force_gate: Optional[Literal[0, 1]] = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        logits_safe_BC = self.model_safe(images_BCHW)
-        logits_unsafe_BC = self.model_unsafe(images_BCHW)
-        probs_safe_BC = torch.softmax(logits_safe_BC, dim=-1)
-        probs_unsafe_BC = torch.softmax(logits_unsafe_BC, dim=-1)
+    def forward(self, images_BCHW: torch.Tensor) -> GatedSystemOutput:
+        safe_logits_BC = self.model_safe(images_BCHW)
+        unsafe_logits_BC = self.model_unsafe(images_BCHW)
+        gate_B1 = self.gate(images_BCHW)
 
-        gate_computed_B1 = self.gate(images_BCHW)
+        probs_safe_BC = torch.softmax(safe_logits_BC, dim=-1)
+        probs_unsafe_BC = torch.softmax(unsafe_logits_BC, dim=-1)
+        prediction_BC = (1 - gate_B1) * probs_safe_BC + gate_B1 * probs_unsafe_BC
 
-        if self.training and kind_labels is not None:
-            # Override based on kind_label: unmarked -> 0, marked (left/right) -> 1, unknown -> keep
-            device = images_BCHW.device
-            dtype = images_BCHW.dtype
-            is_unmarked_B1 = torch.tensor(
-                [kl == "unmarked" for kl in kind_labels], device=device
-            ).unsqueeze(1)
-            is_marked_B1 = torch.tensor(
-                [kl in ("left", "right") for kl in kind_labels], device=device
-            ).unsqueeze(1)
-            is_unknown_B1 = ~(is_unmarked_B1 | is_marked_B1)
-            gate_used_B1 = (
-                is_unmarked_B1.to(dtype) * 0.0
-                + is_marked_B1.to(dtype) * 1.0
-                + is_unknown_B1.to(dtype) * gate_computed_B1
-            )
-        else:
-            # Eval mode: threshold at 0.5
-            gate_used_B1 = (gate_computed_B1 > 0.5).to(images_BCHW.dtype)
+        return {
+            "prediction": prediction_BC,
+            "safe_logits": safe_logits_BC,
+            "unsafe_logits": unsafe_logits_BC,
+            "gate": gate_B1,
+        }
 
-        if force_gate is not None:
-            gate_used_B1 = torch.full_like(gate_used_B1, float(force_gate))
 
-        probs_BC = (1 - gate_used_B1) * probs_safe_BC + gate_used_B1 * probs_unsafe_BC
+def _build_system_metric_frame(
+    system: GatedSystem,
+    dataset: DataLoader,
+    device: torch.device,
+) -> pl.DataFrame:
+    rows: list[dict[str, str | bool]] = []
 
-        return probs_BC, gate_computed_B1, gate_used_B1
+    system.eval()
+    with torch.no_grad():
+        for batch in dataset:
+            images = batch["image"].to(device)
+            labels = batch["label"].to(device)
+            kinds = list(batch["kind"])
+
+            out = system(images)
+            pred = out["prediction"].argmax(dim=-1)
+            pred_safe = out["safe_logits"].argmax(dim=-1)
+            pred_unsafe = out["unsafe_logits"].argmax(dim=-1)
+
+            correct = pred.eq(labels).cpu().tolist()
+            correct_safe = pred_safe.eq(labels).cpu().tolist()
+            correct_unsafe = pred_unsafe.eq(labels).cpu().tolist()
+
+            for c, cs, cu, kind in zip(
+                correct, correct_safe, correct_unsafe, kinds, strict=True
+            ):
+                rows.append(
+                    {
+                        "item_kind": str(kind),
+                        "correct": bool(c),
+                        "correct_safe": bool(cs),
+                        "correct_unsafe": bool(cu),
+                    }
+                )
+
+    sample_df = pl.DataFrame(rows)
+    if sample_df.is_empty():
+        n = len(SYSTEM_KINDS)
+        return pl.DataFrame(
+            {
+                "item_kind": list(SYSTEM_KINDS),
+                "count": [0] * n,
+                "accuracy": [float("nan")] * n,
+                "accuracy_safe": [float("nan")] * n,
+                "accuracy_unsafe": [float("nan")] * n,
+            }
+        )
+
+    metric_df = sample_df.group_by("item_kind").agg(
+        pl.len().alias("count"),
+        pl.col("correct").mean().alias("accuracy"),
+        pl.col("correct_safe").mean().alias("accuracy_safe"),
+        pl.col("correct_unsafe").mean().alias("accuracy_unsafe"),
+    )
+    all_kinds_df = pl.DataFrame({"item_kind": list(SYSTEM_KINDS)})
+    return (
+        all_kinds_df.join(metric_df, on="item_kind", how="left")
+        .with_columns(
+            pl.col("count").fill_null(0),
+            pl.col("accuracy").cast(pl.Float64).fill_null(float("nan")),
+            pl.col("accuracy_safe").cast(pl.Float64).fill_null(float("nan")),
+            pl.col("accuracy_unsafe").cast(pl.Float64).fill_null(float("nan")),
+        )
+        .sort("item_kind")
+    )
+
+
+def _weighted_acc(df: pl.DataFrame, col: str) -> float:
+    valid = df.filter(pl.col("count") > 0)
+    total = valid["count"].sum()
+    if total == 0:
+        return math.nan
+    return float((valid[col] * valid["count"]).sum() / total)
 
 
 def evaluate_gated_system(
@@ -111,139 +168,25 @@ def evaluate_gated_system(
     dataset: DataLoader,
     device: torch.device,
 ) -> dict[str, float]:
-    system.eval()
+    metric_df = _build_system_metric_frame(system, dataset, device)
+    metrics: dict[str, float] = {}
 
-    def _acc(c: float, t: float) -> float:
-        return c / t if t > 0 else math.nan
+    for row in metric_df.iter_rows(named=True):
+        kind = str(row["item_kind"])
+        metrics[f"system/{kind}/accuracy"] = float(row["accuracy"])
+        metrics[f"system_safe/{kind}/accuracy"] = float(row["accuracy_safe"])
+        metrics[f"system_unsafe/{kind}/accuracy"] = float(row["accuracy_unsafe"])
 
-    counts = {
-        "all": (0.0, 0.0),
-        "unmarked": (0.0, 0.0),
-        "unmarked/known": (0.0, 0.0),
-        "unmarked/unknown": (0.0, 0.0),
-        "marked": (0.0, 0.0),
-        "marked/known": (0.0, 0.0),
-        "marked/known/left": (0.0, 0.0),
-        "marked/known/right": (0.0, 0.0),
-        "marked/unknown": (0.0, 0.0),
-        "marked/unknown/left": (0.0, 0.0),
-        "marked/unknown/right": (0.0, 0.0),
-    }
-    system_safe_counts = {k: (0.0, 0.0) for k in counts}
-    system_unsafe_counts = {k: (0.0, 0.0) for k in counts}
+    unmarked = metric_df.filter(pl.col("item_kind").str.starts_with("none-"))
+    marked = metric_df.filter(~pl.col("item_kind").str.starts_with("none-"))
 
-    with torch.no_grad():
-        for batch in dataset:
-            images_BCHW, labels_B, kinds, kind_labels = batch
-            images_BCHW = images_BCHW.to(device)
-            labels_B = labels_B.to(device)
+    for prefix, col in [
+        ("system", "accuracy"),
+        ("system_safe", "accuracy_safe"),
+        ("system_unsafe", "accuracy_unsafe"),
+    ]:
+        metrics[f"{prefix}/all/accuracy"] = _weighted_acc(metric_df, col)
+        metrics[f"{prefix}/unmarked/accuracy"] = _weighted_acc(unmarked, col)
+        metrics[f"{prefix}/marked/accuracy"] = _weighted_acc(marked, col)
 
-            probs_BC, _, _ = system(images_BCHW, force_gate=None)
-            probs_safe_BC, _, _ = system(images_BCHW, force_gate=0)
-            probs_unsafe_BC, _, _ = system(images_BCHW, force_gate=1)
-            pred_B = probs_BC.argmax(dim=-1)
-            pred_safe_B = probs_safe_BC.argmax(dim=-1)
-            pred_unsafe_B = probs_unsafe_BC.argmax(dim=-1)
-            correct_B = (pred_B == labels_B).float()
-            correct_safe_B = (pred_safe_B == labels_B).float()
-            correct_unsafe_B = (pred_unsafe_B == labels_B).float()
-
-            is_unmarked_B = torch.tensor(
-                [k == "unmarked" for k in kinds], device=device
-            ).float()
-            is_marked_B = 1.0 - is_unmarked_B
-            is_known_unmarked_B = torch.tensor(
-                [
-                    k == "unmarked" and kl == "unmarked"
-                    for k, kl in zip(kinds, kind_labels)
-                ],
-                device=device,
-            ).float()
-            is_unknown_unmarked_B = torch.tensor(
-                [
-                    k == "unmarked" and kl == "unknown"
-                    for k, kl in zip(kinds, kind_labels)
-                ],
-                device=device,
-            ).float()
-            is_known_marked_B = torch.tensor(
-                [
-                    k != "unmarked" and kl != "unknown"
-                    for k, kl in zip(kinds, kind_labels)
-                ],
-                device=device,
-            ).float()
-            is_unknown_marked_B = torch.tensor(
-                [
-                    k != "unmarked" and kl == "unknown"
-                    for k, kl in zip(kinds, kind_labels)
-                ],
-                device=device,
-            ).float()
-            is_known_left_B = torch.tensor(
-                [k == "left" and kl == "left" for k, kl in zip(kinds, kind_labels)],
-                device=device,
-            ).float()
-            is_known_right_B = torch.tensor(
-                [k == "right" and kl == "right" for k, kl in zip(kinds, kind_labels)],
-                device=device,
-            ).float()
-            is_unknown_left_B = torch.tensor(
-                [k == "left" and kl == "unknown" for k, kl in zip(kinds, kind_labels)],
-                device=device,
-            ).float()
-            is_unknown_right_B = torch.tensor(
-                [k == "right" and kl == "unknown" for k, kl in zip(kinds, kind_labels)],
-                device=device,
-            ).float()
-
-            def _update(
-                c_dict: dict,
-                correct: torch.Tensor,
-                masks: list[tuple[str, torch.Tensor]],
-            ) -> None:
-                for name, mask_B in masks:
-                    old_c, old_t = c_dict[name]
-                    c_dict[name] = (
-                        old_c + (correct * mask_B).sum().item(),
-                        old_t + mask_B.sum().item(),
-                    )
-
-            masks_all = [
-                ("all", torch.ones_like(correct_B)),
-                ("unmarked", is_unmarked_B),
-                ("unmarked/known", is_known_unmarked_B),
-                ("unmarked/unknown", is_unknown_unmarked_B),
-                ("marked", is_marked_B),
-                ("marked/known", is_known_marked_B),
-                ("marked/known/left", is_known_left_B),
-                ("marked/known/right", is_known_right_B),
-                ("marked/unknown", is_unknown_marked_B),
-                ("marked/unknown/left", is_unknown_left_B),
-                ("marked/unknown/right", is_unknown_right_B),
-            ]
-
-            _update(counts, correct_B, masks_all)
-            _update(system_safe_counts, correct_safe_B, masks_all)
-            _update(system_unsafe_counts, correct_unsafe_B, masks_all)
-
-    priority_metrics = ["system/all", "system_safe/unmarked", "system_safe/marked"]
-
-    all_metrics: dict[str, float] = {}
-    for name in counts:
-        c, t = counts[name]
-        all_metrics[f"system/{name}/accuracy"] = _acc(c, t)
-    for name in system_safe_counts:
-        c, t = system_safe_counts[name]
-        all_metrics[f"system_safe/{name}/accuracy"] = _acc(c, t)
-    for name in system_unsafe_counts:
-        c, t = system_unsafe_counts[name]
-        all_metrics[f"system_unsafe/{name}/accuracy"] = _acc(c, t)
-
-    result: dict[str, float] = {}
-    for base in priority_metrics:
-        key = f"{base}/accuracy"
-        if key in all_metrics:
-            result[f"@/{key}"] = all_metrics.pop(key)
-    result.update(all_metrics)
-    return result
+    return metrics

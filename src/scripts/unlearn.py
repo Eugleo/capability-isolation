@@ -1,9 +1,10 @@
 import json
+import uuid
 from dataclasses import asdict
+from datetime import datetime
 from pathlib import Path
 
 import matplotlib.pyplot as plt
-import numpy as np
 import polars as pl
 import torch
 import torch.nn as nn
@@ -13,20 +14,49 @@ from torch.utils.data import DataLoader, Subset
 from src.classifier import Classifier, evaluate_classifier
 from src.config import Config
 from src.data import MarkedMNIST
-from src.train_classifier import build_eval_dataframe
+from src.gate import Gate
+from src.system import GatedSystem, evaluate_gated_system
+from src.train_classifier import build_eval_dataframe, plot_classifier_evaluation
 from src.utils import format_metric_value, get_device, set_seed
 
-# Weights for the two extra losses (maximize right/left-marked loss, maximize L2 divergence)
 WEIGHT_MARKED_LOSS = 5e-5
 WEIGHT_DIVERGENCE = 0.0
-KEEP_ORDER = ["m", "m+unk", "u", "u+unk"]
-DATA_TYPE_ORDER = ["unmarked", "marked-left", "marked-right"]
-FORGET_COLORS = {
-    "m": "#ff7f00",
-    "m+unk": "#a65628",
-    "u": "#999999",
-    "u+unk": "#f781bf",
-}
+
+BASELINE_SYSTEM_PATH = Path("experiments/2026-03-11_15-54-45_0ccf2fb5/system.pt")
+
+STRATEGIES = [
+    {
+        "name": "retain_safe__forget_unsafe",
+        "display_name": "Retain safe / Forget unsafe",
+        "positive_categories": ("safe",),
+        "negative_categories": ("unsafe",),
+        "use_known_only": True,
+    },
+    {
+        "name": "retain_safe_unk__forget_unsafe",
+        "display_name": "Retain safe+unk / Forget unsafe",
+        "positive_categories": ("safe", "unknown"),
+        "negative_categories": ("unsafe",),
+        "use_known_only": False,
+    },
+    {
+        "name": "retain_safe__forget_unsafe_unk",
+        "display_name": "Retain safe / Forget unsafe+unk",
+        "positive_categories": ("safe",),
+        "negative_categories": ("unsafe", "unknown"),
+        "use_known_only": False,
+    },
+]
+
+PARETO_COLORS = ["#377eb8", "#4daf4a", "#e41a1c", "#984ea3"]
+PARETO_MARKERS = ["o", "s", "^", "D"]
+
+
+def _sample_category(mark: str, is_known: bool) -> str:
+    """Classify a sample: unknown trumps mark, then none→safe, else unsafe."""
+    if not is_known:
+        return "unknown"
+    return "safe" if mark == "none" else "unsafe"
 
 
 def l2_weight_divergence(model: nn.Module, frozen: nn.Module) -> torch.Tensor:
@@ -34,112 +64,6 @@ def l2_weight_divergence(model: nn.Module, frozen: nn.Module) -> torch.Tensor:
     for p, p_frozen in zip(model.parameters(), frozen.parameters()):
         total = total + ((p - p_frozen) ** 2).sum()
     return total
-
-
-def parse_unlearn_model_name(model_name: str) -> tuple[str, str] | None:
-    prefix = "classifier_pos="
-    separator = "_neg="
-    if not model_name.startswith(prefix) or separator not in model_name:
-        return None
-    model_spec = model_name.removeprefix(prefix)
-    keep_label, forget_label = model_spec.split(separator, maxsplit=1)
-    return keep_label, forget_label
-
-
-def plot_unlearn_evaluation(
-    df: pl.DataFrame,
-    save_path: Path | str,
-    *,
-    jitter: float = 0.03,
-    alpha: float = 1.0,
-) -> None:
-    """Plot unlearning results as a 4x3 grid grouped by kept capability."""
-    if df.is_empty():
-        return
-
-    parsed_rows: list[dict[str, str | float]] = []
-    for row in df.iter_rows(named=True):
-        parsed = parse_unlearn_model_name(str(row["model"]))
-        if parsed is None:
-            continue
-        keep_label, forget_label = parsed
-        parsed_rows.append(
-            {
-                "model": str(row["model"]),
-                "epoch": float(row["epoch"]),
-                "data_type": str(row["data_type"]),
-                "accuracy": float(row["accuracy"]),
-                "keep_label": keep_label,
-                "forget_label": forget_label,
-            }
-        )
-
-    if not parsed_rows:
-        return
-
-    plot_df = pl.DataFrame(parsed_rows)
-    fig, axes = plt.subplots(
-        len(KEEP_ORDER),
-        len(DATA_TYPE_ORDER),
-        figsize=(14, 12),
-        sharex=True,
-        sharey=True,
-    )
-    rng = np.random.default_rng(42)
-
-    for row_idx, keep_label in enumerate(KEEP_ORDER):
-        row_handles: dict[str, plt.Line2D] = {}
-        for col_idx, data_type in enumerate(DATA_TYPE_ORDER):
-            ax = axes[row_idx, col_idx]
-            panel_df = plot_df.filter(
-                (pl.col("keep_label") == keep_label)
-                & (pl.col("data_type") == data_type)
-            )
-            if panel_df.is_empty():
-                ax.set_title(data_type)
-                ax.grid(True, alpha=0.3)
-                continue
-
-            forget_labels = panel_df["forget_label"].unique().sort().to_list()
-            for forget_label in forget_labels:
-                model_df = panel_df.filter(pl.col("forget_label") == forget_label).sort(
-                    "epoch"
-                )
-                epochs = np.array(model_df["epoch"].to_list())
-                accuracies = np.array(model_df["accuracy"].to_list())
-                if jitter > 0:
-                    epochs = epochs + rng.uniform(-jitter, jitter, size=len(epochs))
-                (line,) = ax.plot(
-                    epochs,
-                    accuracies,
-                    color=FORGET_COLORS.get(forget_label, "#888888"),
-                    alpha=alpha,
-                    marker="o",
-                    markersize=4,
-                    label=f"forget {forget_label}",
-                )
-                row_handles.setdefault(f"forget {forget_label}", line)
-
-            ax.set_title(data_type)
-            ax.set_ylim(0, 1)
-            ax.grid(True, alpha=0.3)
-            if row_idx == len(KEEP_ORDER) - 1:
-                ax.set_xlabel("Epoch")
-            if col_idx == 0:
-                ax.set_ylabel(f"Keep {keep_label}\nAccuracy")
-
-        if row_handles:
-            axes[row_idx, 0].legend(
-                row_handles.values(),
-                row_handles.keys(),
-                loc="lower right",
-                fontsize=8,
-                title=f"keep {keep_label}",
-            )
-
-    fig.tight_layout()
-    fig.savefig(save_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
 
 
 def train_entanglement_unlearn(
@@ -151,8 +75,8 @@ def train_entanglement_unlearn(
     epochs: int = 3,
     lr: float = 1e-3,
     *,
-    positive_kind_labels: tuple[str, ...] = ("unmarked",),
-    negative_kind_labels: tuple[str, ...] = ("left", "right"),
+    positive_categories: tuple[str, ...] = ("safe",),
+    negative_categories: tuple[str, ...] = ("unsafe",),
 ) -> tuple[Classifier, list[dict[str, float]]]:
     """Unlearn negative capability while preserving positive. Returns (model, epoch_history)."""
     model.train()
@@ -168,33 +92,33 @@ def train_entanglement_unlearn(
         total_loss = 0.0
         n_batches = 0
 
-        for images, labels, _, kind_labels in train_loader:
-            images = images.to(device)
-            labels = labels.to(device)
+        for batch in train_loader:
+            images = batch["image"].to(device)
+            labels = batch["label"].to(device)
+            marks = list(batch["mark"])
+            is_known_list = batch["is_known"].tolist()
 
+            categories = [_sample_category(m, k) for m, k in zip(marks, is_known_list)]
             positive_mask = torch.tensor(
-                [kl in positive_kind_labels for kl in kind_labels], device=device
+                [c in positive_categories for c in categories], device=device
             )
             negative_mask = torch.tensor(
-                [kl in negative_kind_labels for kl in kind_labels], device=device
+                [c in negative_categories for c in categories], device=device
             )
 
             optimizer.zero_grad()
             logits = model(images)
 
-            # Minimize prediction loss on positive (preserve)
             if positive_mask.any():
                 loss_positive = criterion(logits[positive_mask], labels[positive_mask])
             else:
                 loss_positive = torch.tensor(0.0, device=device)
 
-            # Maximize prediction loss on negative (unlearn)
             if negative_mask.any():
                 loss_negative = criterion(logits[negative_mask], labels[negative_mask])
             else:
                 loss_negative = torch.tensor(0.0, device=device)
 
-            # Maximize L2 weight divergence
             divergence = l2_weight_divergence(model, frozen)
 
             loss = (
@@ -208,7 +132,7 @@ def train_entanglement_unlearn(
             total_loss += loss.item()
             n_batches += 1
 
-        avg_loss = total_loss / n_batches
+        avg_loss = total_loss / max(n_batches, 1)
         model.eval()
         metrics = evaluate_classifier(model, test_loader, device)
         model.train()
@@ -219,9 +143,49 @@ def train_entanglement_unlearn(
         metric_str = "".join(
             f"\n  {k}: {format_metric_value(k, v)}" for k, v in metrics.items()
         )
-        print(f"Epoch {epoch + 1}/{epochs} - Loss: {avg_loss:.4f}, {metric_str}")
+        print(f"Epoch {epoch + 1}/{epochs} - Loss: {avg_loss:.4f}{metric_str}")
 
     return model, history
+
+
+def plot_pareto(
+    results: list[dict],
+    save_path: Path | str,
+) -> None:
+    fig, ax = plt.subplots(figsize=(8, 6))
+
+    for i, result in enumerate(results):
+        ax.scatter(
+            result["performance"] * 100,
+            result["safety"],
+            color=PARETO_COLORS[i % len(PARETO_COLORS)],
+            marker=PARETO_MARKERS[i % len(PARETO_MARKERS)],
+            s=120,
+            label=result["display_name"],
+            zorder=3,
+            edgecolors="black",
+            linewidths=0.5,
+        )
+
+    ax.set_xlabel("Performance (System Accuracy %)", fontsize=11)
+    ax.set_ylabel("Safety (100 − Safe Acc. on Unsafe Data %)", fontsize=11)
+    ax.set_title("Performance vs Safety", fontsize=13)
+    ax.legend(loc="best", fontsize=9)
+    ax.grid(True, alpha=0.3)
+
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _create_experiment_dir() -> Path:
+    experiments_root = Path("experiments")
+    experiments_root.mkdir(exist_ok=True)
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    short_id = uuid.uuid4().hex[:8]
+    exp_dir = experiments_root / f"{timestamp}_{short_id}"
+    exp_dir.mkdir(parents=True)
+    return exp_dir
 
 
 def main() -> None:
@@ -230,33 +194,29 @@ def main() -> None:
     device = get_device()
     print(f"Using device: {device}")
 
-    print("Weight of loss on positive: ", 1.0)
-    print("Weight of (negative) loss on negative: ", WEIGHT_MARKED_LOSS)
-    print("Weight of L2-divergence: ", WEIGHT_DIVERGENCE)
+    print("Weight of loss on positive: 1.0")
+    print(f"Weight of (negative) loss on negative: {WEIGHT_MARKED_LOSS}")
+    print(f"Weight of L2-divergence: {WEIGHT_DIVERGENCE}")
 
-    # Load pretrained classifier
     checkpoint_dir = Path(config.checkpoint_dir)
+    experiment_dir = _create_experiment_dir()
+    print(f"Experiment dir: {experiment_dir}")
+    with open(experiment_dir / "config.json", "w") as f:
+        json.dump(asdict(config), f, indent=2)
+
     base_model = Classifier.load(checkpoint_dir / "classifier_all", device=device)
 
-    # Load dataset
     train_dataset = MarkedMNIST(
-        train=True,
-        kind_fraction=config.kind_fraction,
-        seed=config.seed,
+        train=True, kind_fraction=config.kind_fraction, seed=config.seed
     )
     test_dataset = MarkedMNIST(
-        train=False,
-        kind_fraction=config.kind_fraction,
-        seed=config.seed + 1,
+        train=False, kind_fraction=config.kind_fraction, seed=config.seed + 1
     )
     train_dataset.print_summary("Train dataset")
     test_dataset.print_summary("Test dataset")
 
-    # Train loaders for experiments
     known_train_indices = [
-        i
-        for i in range(len(train_dataset))
-        if train_dataset.kind_label_arr[i] != "unknown"
+        i for i in range(len(train_dataset)) if train_dataset.is_known_arr[i]
     ]
     train_known_only = Subset(train_dataset, known_train_indices)
 
@@ -289,132 +249,154 @@ def main() -> None:
     for k, v in evaluate_classifier(base_model, test_loader, device).items():
         print(f"  {k}: {format_metric_value(k, v)}")
 
-    metrics_csv_path = checkpoint_dir / "classifier_unlearn_metrics.csv"
-    if metrics_csv_path.exists():
-        print(f"\nLoading per-epoch metrics from {metrics_csv_path}")
-        plot_unlearn_evaluation(
-            pl.read_csv(metrics_csv_path),
-            checkpoint_dir / "classifier_unlearn_evaluation.png",
-            jitter=0.03,
-            alpha=1.0,
-        )
-        print(
-            f"\nSaved evaluation plot to {checkpoint_dir / 'classifier_unlearn_evaluation.png'}"
-        )
-        return
-
     model_histories: dict[str, list[dict[str, float]]] = {}
+    trained_models: dict[str, Classifier] = {}
 
-    def _run_unlearn(
-        name: str,
-        positive: tuple[str, ...],
-        negative: tuple[str, ...],
-        train_loader: DataLoader,
-    ) -> None:
-        save_dir = checkpoint_dir / name
-        model_path = save_dir / "model.pt"
+    for strategy in STRATEGIES:
+        name = strategy["name"]
+        display_name = strategy["display_name"]
+        positive = strategy["positive_categories"]
+        negative = strategy["negative_categories"]
+        loader = train_loader_known if strategy["use_known_only"] else train_loader_full
+
         model = Classifier().to(device)
         model.load_state_dict(base_model.state_dict())
         frozen = Classifier().to(device)
         frozen.load_state_dict(base_model.state_dict())
-        frozen.eval()
-        for p in frozen.parameters():
-            p.requires_grad_(False)
 
-        print("\n" + "=" * 60)
-        print(f"Training {name} (positive={positive}, negative={negative})")
+        print(f"\n{'=' * 60}")
+        print(f"Training: {display_name}")
+        print(f"  positive={positive}, negative={negative}")
         print("=" * 60)
+
         model, history = train_entanglement_unlearn(
             model,
             frozen,
-            train_loader,
+            loader,
             test_loader,
             device,
             epochs=config.classifier_epochs,
             lr=config.classifier_lr,
-            positive_kind_labels=positive,
-            negative_kind_labels=negative,
+            positive_categories=positive,
+            negative_categories=negative,
         )
 
+        save_dir = experiment_dir / name
         save_dir.mkdir(parents=True, exist_ok=True)
-        model.save(model_path)
+        model.save(save_dir / "model.pt")
         with open(save_dir / "config.json", "w") as f:
-            json.dump(asdict(config), f, indent=2)
-        print(f"Saved to {model_path}")
+            json.dump(
+                {**asdict(config), "strategy": strategy},
+                f,
+                indent=2,
+            )
+        print(f"Saved to {save_dir / 'model.pt'}")
 
-        metrics = (
-            history[-1] if history else evaluate_classifier(model, test_loader, device)
-        )
-        print(f"{name} evaluation:")
-        for k, v in metrics.items():
-            if k == "epoch":
-                continue
-            print(f"  {k}: {format_metric_value(k, v)}")
-        model_histories[name] = history
+        model_histories[display_name] = history
+        trained_models[name] = model
 
-    # Keep unmarked variants, remove marked variants (u=unmarked, m=marked, unk=unknown)
-    _run_unlearn(
-        "classifier_pos=u_neg=m", ("unmarked",), ("left", "right"), train_loader_known
-    )
-    _run_unlearn(
-        "classifier_pos=u_neg=m+unk",
-        ("unmarked",),
-        ("left", "right", "unknown"),
-        train_loader_full,
-    )
-    _run_unlearn(
-        "classifier_pos=u+unk_neg=m",
-        ("unmarked", "unknown"),
-        ("left", "right"),
-        train_loader_full,
-    )
-    _run_unlearn(
-        "classifier_pos=u+unk_neg=m+unk",
-        ("unmarked", "unknown"),
-        ("left", "right", "unknown"),
-        train_loader_full,
-    )
-
-    # Keep marked variants, remove unmarked variants
-    _run_unlearn(
-        "classifier_pos=m_neg=u", ("left", "right"), ("unmarked",), train_loader_known
-    )
-    _run_unlearn(
-        "classifier_pos=m_neg=u+unk",
-        ("left", "right"),
-        ("unmarked", "unknown"),
-        train_loader_full,
-    )
-    _run_unlearn(
-        "classifier_pos=m+unk_neg=u",
-        ("left", "right", "unknown"),
-        ("unmarked",),
-        train_loader_full,
-    )
-    _run_unlearn(
-        "classifier_pos=m+unk_neg=u+unk",
-        ("left", "right", "unknown"),
-        ("unmarked", "unknown"),
-        train_loader_full,
-    )
-
-    # Evaluation plot
+    # Classifier evaluation plot (accuracy per kind over epochs)
     if model_histories:
         eval_df = build_eval_dataframe(model_histories)
+        metrics_csv_path = experiment_dir / "classifier_unlearn_metrics.csv"
         eval_df.write_csv(metrics_csv_path)
-        plot_unlearn_evaluation(
-            pl.read_csv(metrics_csv_path),
-            checkpoint_dir / "classifier_unlearn_evaluation.png",
-            jitter=0.03,
-            alpha=1.0,
+        plot_classifier_evaluation(
+            eval_df,
+            experiment_dir / "classifier_unlearn_evaluation.png",
+            use_palette=True,
+            single_legend=True,
         )
-        print(f"\nSaved per-epoch metrics CSV to {metrics_csv_path}")
+        print(f"\nSaved classifier metrics to {metrics_csv_path}")
         print(
-            f"\nSaved evaluation plot to {checkpoint_dir / 'classifier_unlearn_evaluation.png'}"
+            f"Saved evaluation plot to"
+            f" {experiment_dir / 'classifier_unlearn_evaluation.png'}"
         )
 
-    print("\n" + "=" * 60)
-    print("All unlearn models saved to", checkpoint_dir)
+    # --- Pareto comparison ---
+    # Build systems: gate_known + unlearned safe model + classifier_all as unsafe
+    print(f"\n{'=' * 60}")
+    print("Building systems for Pareto comparison")
+    print("=" * 60)
+
+    gate_known = Gate().to(device)
+    gate_known.load_state_dict(
+        torch.load(
+            checkpoint_dir / "gate_known.pt",
+            map_location=device,
+            weights_only=True,
+        )["model_state_dict"]
+    )
+    gate_known.eval()
+
+    model_unsafe = Classifier.load(checkpoint_dir / "classifier_all", device=device)
+    model_unsafe.eval()
+
+    pareto_results: list[dict] = []
+
+    for strategy in STRATEGIES:
+        name = strategy["name"]
+        display_name = strategy["display_name"]
+        model_safe = trained_models[name]
+        model_safe.eval()
+
+        system = GatedSystem(
+            gate=gate_known, model_safe=model_safe, model_unsafe=model_unsafe
+        )
+        system_metrics = evaluate_gated_system(system, test_loader, device)
+
+        performance = system_metrics["system/all/accuracy"]
+        safe_acc_on_unsafe = system_metrics["system_safe/marked/accuracy"]
+        safety = 100.0 - safe_acc_on_unsafe * 100.0
+
+        print(f"\n{display_name}:")
+        print(f"  Performance (system accuracy): {performance:.2%}")
+        print(f"  Safe model acc on unsafe data: {safe_acc_on_unsafe:.2%}")
+        print(f"  Safety: {safety:.1f}")
+
+        pareto_results.append(
+            {
+                "name": name,
+                "display_name": display_name,
+                "performance": performance,
+                "safety": safety,
+            }
+        )
+
+    # Baseline system
+    if BASELINE_SYSTEM_PATH.exists():
+        print(f"\nLoading baseline system from {BASELINE_SYSTEM_PATH}")
+        baseline_system = GatedSystem.load(BASELINE_SYSTEM_PATH, device=device)
+        baseline_metrics = evaluate_gated_system(baseline_system, test_loader, device)
+
+        performance = baseline_metrics["system/all/accuracy"]
+        safe_acc_on_unsafe = baseline_metrics["system_safe/marked/accuracy"]
+        safety = 100.0 - safe_acc_on_unsafe * 100.0
+
+        print("Jointly trained (baseline):")
+        print(f"  Performance (system accuracy): {performance:.2%}")
+        print(f"  Safe model acc on unsafe data: {safe_acc_on_unsafe:.2%}")
+        print(f"  Safety: {safety:.1f}")
+
+        pareto_results.append(
+            {
+                "name": "baseline_jointly_trained",
+                "display_name": "Jointly trained (baseline)",
+                "performance": performance,
+                "safety": safety,
+            }
+        )
+    else:
+        print(f"\nWarning: baseline not found at {BASELINE_SYSTEM_PATH}")
+
+    plot_pareto(pareto_results, experiment_dir / "pareto_performance_safety.png")
+    print(f"\nSaved Pareto plot to {experiment_dir / 'pareto_performance_safety.png'}")
+
+    pareto_df = pl.DataFrame(pareto_results)
+    pareto_df.write_csv(experiment_dir / "pareto_results.csv")
+    print(f"Saved Pareto results to {experiment_dir / 'pareto_results.csv'}")
+
+    print(f"\n{'=' * 60}")
+    print(f"All outputs saved to {experiment_dir}")
     print("=" * 60)
 
 

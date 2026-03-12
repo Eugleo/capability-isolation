@@ -27,29 +27,28 @@ BASELINE_SYSTEM_PATH = Path("experiments/2026-03-11_15-54-45_0ccf2fb5/system.pt"
 STRATEGIES = [
     {
         "name": "retain_safe__forget_unsafe",
-        "display_name": "Retain safe / Forget unsafe",
+        "display_name": "Baseline (retain safe, forget unsafe)",
         "positive_categories": ("safe",),
         "negative_categories": ("unsafe",),
         "use_known_only": True,
     },
     {
         "name": "retain_safe_unk__forget_unsafe",
-        "display_name": "Retain safe+unk / Forget unsafe",
+        "display_name": "Baseline (retain safe+unk, forget unsafe)",
         "positive_categories": ("safe", "unknown"),
         "negative_categories": ("unsafe",),
         "use_known_only": False,
     },
     {
         "name": "retain_safe__forget_unsafe_unk",
-        "display_name": "Retain safe / Forget unsafe+unk",
+        "display_name": "Baseline (retain safe, forget unsafe+unk)",
         "positive_categories": ("safe",),
         "negative_categories": ("unsafe", "unknown"),
         "use_known_only": False,
     },
 ]
 
-PARETO_COLORS = ["#377eb8", "#4daf4a", "#e41a1c", "#984ea3"]
-PARETO_MARKERS = ["o", "s", "^", "D"]
+UNLEARN_MARKERS = ["o", "s", "^"]
 
 
 def _sample_category(mark: str, is_known: bool) -> str:
@@ -154,23 +153,26 @@ def plot_pareto(
 ) -> None:
     fig, ax = plt.subplots(figsize=(8, 6))
 
-    for i, result in enumerate(results):
+    for result in results:
+        is_ours = result.get("ours", False)
         ax.scatter(
             result["performance"] * 100,
             result["safety"],
-            color=PARETO_COLORS[i % len(PARETO_COLORS)],
-            marker=PARETO_MARKERS[i % len(PARETO_MARKERS)],
-            s=120,
+            color="#DAA520" if is_ours else "black",
+            marker="*" if is_ours else result["marker"],
+            s=300 if is_ours else 100,
             label=result["display_name"],
-            zorder=3,
+            zorder=4 if is_ours else 3,
             edgecolors="black",
-            linewidths=0.5,
+            linewidths=0.8,
         )
 
-    ax.set_xlabel("Performance (System Accuracy %)", fontsize=11)
-    ax.set_ylabel("Safety (100 − Safe Acc. on Unsafe Data %)", fontsize=11)
+    ax.set_xlim(0, 100)
+    ax.set_ylim(0, 100)
+    ax.set_xlabel("Performance \u2191 (System Accuracy %)", fontsize=11)
+    ax.set_ylabel("Safety \u2191 (100 \u2212 Safe Acc. on Unsafe Data %)", fontsize=11)
     ax.set_title("Performance vs Safety", fontsize=13)
-    ax.legend(loc="best", fontsize=9)
+    ax.legend(loc="lower left", fontsize=9)
     ax.grid(True, alpha=0.3)
 
     fig.tight_layout()
@@ -275,7 +277,7 @@ def main() -> None:
             loader,
             test_loader,
             device,
-            epochs=config.classifier_epochs,
+            epochs=3,
             lr=config.classifier_lr,
             positive_categories=positive,
             negative_categories=negative,
@@ -333,7 +335,7 @@ def main() -> None:
 
     pareto_results: list[dict] = []
 
-    for strategy in STRATEGIES:
+    for i, strategy in enumerate(STRATEGIES):
         name = strategy["name"]
         display_name = strategy["display_name"]
         model_safe = trained_models[name]
@@ -359,34 +361,36 @@ def main() -> None:
                 "display_name": display_name,
                 "performance": performance,
                 "safety": safety,
+                "marker": UNLEARN_MARKERS[i % len(UNLEARN_MARKERS)],
             }
         )
 
-    # Baseline system
+    # Jointly trained system (ours)
     if BASELINE_SYSTEM_PATH.exists():
-        print(f"\nLoading baseline system from {BASELINE_SYSTEM_PATH}")
-        baseline_system = GatedSystem.load(BASELINE_SYSTEM_PATH, device=device)
-        baseline_metrics = evaluate_gated_system(baseline_system, test_loader, device)
+        print(f"\nLoading jointly trained system from {BASELINE_SYSTEM_PATH}")
+        ours_system = GatedSystem.load(BASELINE_SYSTEM_PATH, device=device)
+        ours_metrics = evaluate_gated_system(ours_system, test_loader, device)
 
-        performance = baseline_metrics["system/all/accuracy"]
-        safe_acc_on_unsafe = baseline_metrics["system_safe/marked/accuracy"]
+        performance = ours_metrics["system/all/accuracy"]
+        safe_acc_on_unsafe = ours_metrics["system_safe/marked/accuracy"]
         safety = 100.0 - safe_acc_on_unsafe * 100.0
 
-        print("Jointly trained (baseline):")
+        print("Jointly trained (ours):")
         print(f"  Performance (system accuracy): {performance:.2%}")
         print(f"  Safe model acc on unsafe data: {safe_acc_on_unsafe:.2%}")
         print(f"  Safety: {safety:.1f}")
 
         pareto_results.append(
             {
-                "name": "baseline_jointly_trained",
-                "display_name": "Jointly trained (baseline)",
+                "name": "jointly_trained",
+                "display_name": "Ours (jointly trained)",
                 "performance": performance,
                 "safety": safety,
+                "ours": True,
             }
         )
     else:
-        print(f"\nWarning: baseline not found at {BASELINE_SYSTEM_PATH}")
+        print(f"\nWarning: jointly trained system not found at {BASELINE_SYSTEM_PATH}")
 
     plot_pareto(pareto_results, experiment_dir / "pareto_performance_safety.png")
     print(f"\nSaved Pareto plot to {experiment_dir / 'pareto_performance_safety.png'}")

@@ -250,7 +250,7 @@ def train_system(
     )
 
 
-SMOOTHING_WINDOW = 15
+SMOOTHING_WINDOW = 30
 
 
 def plot_batch_kind_metrics(
@@ -488,6 +488,14 @@ def plot_batch_gate_metrics(
                 pl.col("precision").first().alias("precision"),
                 pl.col("recall").first().alias("recall"),
             )
+            .with_columns(
+                pl.col("precision")
+                .rolling_mean(window_size=SMOOTHING_WINDOW, min_periods=1)
+                .alias("precision"),
+                pl.col("recall")
+                .rolling_mean(window_size=SMOOTHING_WINDOW, min_periods=1)
+                .alias("recall"),
+            )
         )
         steps = batch_pr_df["step"].to_list()
         precision = batch_pr_df["precision"].to_list()
@@ -638,13 +646,13 @@ def _create_experiment_dir() -> Path:
 
 def main() -> None:
     config = Config(
-        frontload_known=True,
         system_lr=5e-4,
-        system_epochs=20,
+        system_epochs=64,
         system_trainable=("gate", "safe"),
-        system_init_gate_path=None,
+        system_init_gate_path="gate_known.pt",
         system_init_safe_model="classifier_all/model.pt",
         system_init_unsafe_model="classifier_all/model.pt",
+        system_divergence_weight=0.2,
     )
     set_seed(config.seed)
     device = get_device()

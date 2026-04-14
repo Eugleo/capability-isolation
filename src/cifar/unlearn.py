@@ -27,6 +27,7 @@ SplitMode = Literal["safe", "safe+unk", "dang", "dang+unk"]
 
 @dataclass
 class UnlearnConfig:
+    name: str | None = None
     seed: int = 42
     epochs: int = 20
     lr: float = 1e-5
@@ -35,13 +36,13 @@ class UnlearnConfig:
     max_grad_norm: float = 1.0
     batch_size: int = 128
     eval_every_n_batches: int = 128
-    safety_test_percent: float = 10.0
+    safety_eval_n_per_kind: int = 50
 
     data_root: str = "data"
     dangerous_class: str = "airplane"
     safe_known: str = "atypical"
     dangerous_known: str = "atypical"
-    known_percent: float = 75
+    known_percent: float = 10
     retain_mode: SplitMode = "safe"
     forget_mode: SplitMode = "dang"
 
@@ -49,12 +50,15 @@ class UnlearnConfig:
     experiments_root: str = "experiments"
 
 
-def _create_experiment_dir(root: str) -> Path:
+def _create_experiment_dir(root: str, *, name: str | None = None) -> Path:
     experiments_root = Path(root)
     experiments_root.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    short_id = uuid.uuid4().hex[:8]
-    exp_dir = experiments_root / f"{timestamp}_{short_id}"
+    if name:
+        exp_dir = experiments_root / f"{timestamp}_{name}"
+    else:
+        short_id = uuid.uuid4().hex[:8]
+        exp_dir = experiments_root / f"{timestamp}_{short_id}"
     exp_dir.mkdir(parents=True)
     return exp_dir
 
@@ -82,23 +86,24 @@ def _build_mode_subset(
     return Subset(subset, selected_positions)
 
 
-@torch.no_grad()
-def evaluate_average_loss(
-    model: nn.Module, loader: DataLoader, device: torch.device
-) -> float:
-    model.eval()
-    criterion = nn.CrossEntropyLoss(reduction="sum")
-    total_loss = 0.0
-    total_count = 0
+def _sample_safety_eval_subset(
+    dataset: CIFAR10Safety,
+    *,
+    n_per_kind: int,
+    seed: int,
+) -> Subset[CIFAR10Safety]:
+    import numpy as np
 
-    for batch in loader:
-        images = batch["image"].to(device)
-        labels = batch["label"].to(device)
-        logits = model(images)
-        total_loss += float(criterion(logits, labels).item())
-        total_count += int(labels.size(0))
-
-    return total_loss / max(total_count, 1)
+    rng = np.random.RandomState(seed)
+    selected: list[int] = []
+    for kind in ALL_KINDS:
+        kind_indices = np.flatnonzero(dataset.kind_arr == kind)
+        if len(kind_indices) == 0:
+            continue
+        n = min(n_per_kind, len(kind_indices))
+        selected.extend(rng.choice(kind_indices, size=n, replace=False).tolist())
+    selected.sort()
+    return Subset(dataset, selected)
 
 
 @torch.no_grad()
@@ -167,12 +172,12 @@ def _append_cifar_class_rows(
     rows: list[dict[str, float | str]],
     metrics: dict[str, float],
     *,
-    epoch: int,
+    step: int,
 ) -> None:
     for class_name in CIFAR10_CLASSES:
         rows.append(
             {
-                "epoch": float(epoch),
+                "step": float(step),
                 "class": class_name,
                 "count": metrics[f"class/{class_name}/count"],
                 "loss": metrics[f"class/{class_name}/loss"],
@@ -212,33 +217,85 @@ def plot_safety_metric_by_kind(
     plt.close(fig)
 
 
-def plot_cifar_class_accuracy_by_epoch(df: pl.DataFrame, save_path: Path) -> None:
-    fig, ax = plt.subplots(figsize=(12, 7))
-    for class_name in CIFAR10_CLASSES:
-        class_df = df.filter(pl.col("class") == class_name).sort("epoch")
-        if class_df.is_empty():
-            continue
+def plot_unlearn_pareto(
+    df: pl.DataFrame,
+    *,
+    dangerous_class: str,
+    save_path: Path,
+) -> None:
+    import matplotlib.colors as mcolors
+
+    steps = sorted(df["step"].unique().to_list())
+    other_acc_pct: list[float] = []
+    forget_quality_pct: list[float] = []
+
+    for step in steps:
+        step_df = df.filter(pl.col("step") == step)
+        dang = step_df.filter(pl.col("class") == dangerous_class)["accuracy"].item()
+        others = step_df.filter(pl.col("class") != dangerous_class)["accuracy"].mean()
+        other_acc_pct.append(float(others) * 100)
+        forget_quality_pct.append((1.0 - float(dang)) * 100)
+
+    norm = mcolors.Normalize(vmin=min(steps), vmax=max(steps))
+    cmap = plt.get_cmap("cool")
+
+    fig, ax = plt.subplots(figsize=(7, 7))
+
+    for i in range(len(steps) - 1):
         ax.plot(
-            class_df["epoch"].to_list(),
-            class_df["accuracy"].to_list(),
-            label=class_name,
-            marker="o",
-            markersize=3,
-            linewidth=1.0,
+            other_acc_pct[i : i + 2],
+            forget_quality_pct[i : i + 2],
+            color=cmap(norm(steps[i])),
+            linewidth=1.5,
+            zorder=1,
         )
-    ax.set_xlabel("Epoch")
-    ax.set_ylabel("Accuracy")
-    ax.set_ylim(0, 1)
-    ax.set_title("CIFAR Test Accuracy by Class and Epoch")
-    ax.grid(True, alpha=0.3)
-    ax.legend(ncol=2, fontsize=8)
+
+    sc = ax.scatter(
+        other_acc_pct,
+        forget_quality_pct,
+        c=steps,
+        cmap="cool",
+        norm=norm,
+        s=50,
+        edgecolors="white",
+        linewidths=0.5,
+        zorder=2,
+    )
+    cbar = fig.colorbar(sc, ax=ax, pad=0.02)
+    cbar.set_label("Step", fontsize=11)
+
+    ax.set_xlabel("Other Classes Accuracy (%) \u2191", fontsize=12)
+    ax.set_ylabel(
+        f"1 \u2212 {dangerous_class.capitalize()} Accuracy (%) \u2191", fontsize=12
+    )
+    ax.set_xlim(0, 100)
+    ax.set_ylim(0, 100)
+    ax.set_title("Unlearning Pareto: Retain Utility vs Forget Quality", fontsize=13)
+    ax.grid(True, alpha=0.25)
     fig.tight_layout()
     fig.savefig(save_path, dpi=150)
     plt.close(fig)
 
 
-def main() -> None:
-    config = UnlearnConfig()
+def _run_eval(
+    model: nn.Module,
+    *,
+    cifar_test_loader: DataLoader,
+    safety_eval_loader: DataLoader,
+    device: torch.device,
+    step: int,
+    epoch: int,
+    safety_rows: list[dict[str, float | str]],
+    cifar_class_rows: list[dict[str, float | str]],
+) -> dict[str, float]:
+    safety_metrics = evaluate_safety_by_kind(model, safety_eval_loader, device)
+    _append_safety_rows(safety_rows, safety_metrics, step=step, epoch=epoch)
+    cifar_metrics = evaluate_overall_and_per_class(model, cifar_test_loader, device)
+    _append_cifar_class_rows(cifar_class_rows, cifar_metrics, step=step)
+    return cifar_metrics
+
+
+def main(config: UnlearnConfig) -> None:
     set_seed(config.seed)
     device = get_device()
 
@@ -258,6 +315,7 @@ def main() -> None:
 
     retain_kinds = set(_mode_to_kinds(config.retain_mode))
     forget_kinds = set(_mode_to_kinds(config.forget_mode))
+    train_kinds = retain_kinds | forget_kinds
     if ("u-safe" in retain_kinds or "u-dang" in retain_kinds) and (
         "u-safe" in forget_kinds or "u-dang" in forget_kinds
     ):
@@ -266,77 +324,65 @@ def main() -> None:
             "Choose modes so unknown belongs to only one side (or neither)."
         )
 
-    experiment_dir = _create_experiment_dir(config.experiments_root)
+    experiment_dir = _create_experiment_dir(config.experiments_root, name=config.name)
     with open(experiment_dir / "config.json", "w") as f:
         json.dump(asdict(config), f, indent=2)
     print(f"Experiment dir: {experiment_dir}")
 
     eval_transform = get_eval_transform()
-    train_dataset_eval = CIFAR10(
+    cifar_train = CIFAR10(
         train=True, root=config.data_root, transform=eval_transform
     )
-    cifar_test_dataset = CIFAR10(
+    cifar_test = CIFAR10(
         train=False, root=config.data_root, transform=eval_transform
     )
     safety_dataset = CIFAR10Safety.from_cifar10(
-        train_dataset_eval,
+        cifar_train,
         dangerous_class=config.dangerous_class,
         safe_known=validate_known_policy(config.safe_known),
         dangerous_known=validate_known_policy(config.dangerous_known),
         known_percent=config.known_percent,
         seed=config.seed,
     )
-    safety_train_subset, safety_test_subset = safety_dataset.train_test_subsets_by_kind(
-        test_percent=config.safety_test_percent,
+
+    train_subset = _build_mode_subset(
+        Subset(safety_dataset, list(range(len(safety_dataset)))),
+        train_kinds,
+    )
+    safety_eval_subset = _sample_safety_eval_subset(
+        safety_dataset,
+        n_per_kind=config.safety_eval_n_per_kind,
         seed=config.seed,
     )
 
-    # Build retain/forget subsets only for eval monitoring.
-    retain_train_subset = _build_mode_subset(safety_train_subset, retain_kinds)
-    forget_train_subset = _build_mode_subset(safety_train_subset, forget_kinds)
-    if len(forget_train_subset) == 0:
-        raise ValueError(
-            "NegGrad requires a non-empty forget subset. "
-            "Adjust forget_mode/split settings."
-        )
-
-    # Single shuffled training loader over ALL training examples.
     train_loader = DataLoader(
-        safety_train_subset,
+        train_subset,
         batch_size=config.batch_size,
         shuffle=True,
         num_workers=0,
     )
-    retain_train_eval_loader = DataLoader(
-        retain_train_subset,
-        batch_size=config.batch_size,
-        shuffle=False,
-        num_workers=0,
-    )
-    forget_train_eval_loader = DataLoader(
-        forget_train_subset,
-        batch_size=config.batch_size,
-        shuffle=False,
-        num_workers=0,
-    )
-    safety_test_loader = DataLoader(
-        safety_test_subset,
+    safety_eval_loader = DataLoader(
+        safety_eval_subset,
         batch_size=config.batch_size,
         shuffle=False,
         num_workers=0,
     )
     cifar_test_loader = DataLoader(
-        cifar_test_dataset,
+        cifar_test,
         batch_size=config.batch_size,
         shuffle=False,
         num_workers=0,
     )
 
+    n_retain = sum(
+        1 for idx in train_subset.indices
+        for base_idx in [train_subset.dataset.indices[idx]]
+        if str(safety_dataset.kind_arr[base_idx]) in retain_kinds
+    )
+    n_forget = len(train_subset) - n_retain
     print(
-        "Split sizes - "
-        f"train={len(safety_train_subset)} "
-        f"(retain={len(retain_train_subset)}, forget={len(forget_train_subset)}), "
-        f"safety_test={len(safety_test_subset)}"
+        f"Train={len(train_subset)} (retain={n_retain}, forget={n_forget}), "
+        f"safety_eval={len(safety_eval_subset)}"
     )
 
     model = build_cifar_resnet18().to(device)
@@ -357,16 +403,19 @@ def main() -> None:
 
     safety_rows: list[dict[str, float | str]] = []
     cifar_class_rows: list[dict[str, float | str]] = []
+    eval_kwargs = dict(
+        cifar_test_loader=cifar_test_loader,
+        safety_eval_loader=safety_eval_loader,
+        device=device,
+        safety_rows=safety_rows,
+        cifar_class_rows=cifar_class_rows,
+    )
 
-    baseline_safety = evaluate_safety_by_kind(model, safety_test_loader, device)
-    _append_safety_rows(safety_rows, baseline_safety, step=0, epoch=0)
-    baseline_cifar = evaluate_overall_and_per_class(model, cifar_test_loader, device)
-    _append_cifar_class_rows(cifar_class_rows, baseline_cifar, epoch=0)
+    _run_eval(model, step=0, epoch=0, **eval_kwargs)
 
     global_step = 0
     for epoch in range(1, config.epochs + 1):
         model.train()
-        epoch_loss = 0.0
         epoch_retain_loss = 0.0
         epoch_forget_loss = 0.0
         epoch_retain_count = 0
@@ -382,69 +431,47 @@ def main() -> None:
                 dtype=torch.bool,
                 device=device,
             )
-            forget_mask = torch.tensor(
-                [str(k) in forget_kinds for k in kinds],
-                dtype=torch.bool,
-                device=device,
-            )
+            forget_mask = ~retain_mask
 
             optimizer.zero_grad()
             logits = model(images)
             per_sample_loss = criterion(logits, labels)
 
-            loss = torch.tensor(0.0, device=device)
-
-            if retain_mask.any():
-                retain_loss = per_sample_loss[retain_mask].mean()
-                loss = loss + retain_loss
-                epoch_retain_loss += retain_loss.item() * int(retain_mask.sum())
-                epoch_retain_count += int(retain_mask.sum())
-
-            if forget_mask.any():
-                forget_loss = per_sample_loss[forget_mask].mean()
-                loss = loss - config.neggrad_forget_weight * forget_loss
-                epoch_forget_loss += forget_loss.item() * int(forget_mask.sum())
-                epoch_forget_count += int(forget_mask.sum())
+            zero = torch.tensor(0.0, device=device)
+            retain_loss = per_sample_loss[retain_mask].mean() if retain_mask.any() else zero
+            forget_loss = per_sample_loss[forget_mask].mean() if forget_mask.any() else zero
+            loss = retain_loss - config.neggrad_forget_weight * forget_loss
 
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm)
             optimizer.step()
 
-            epoch_loss += loss.item()
+            if retain_mask.any():
+                epoch_retain_loss += retain_loss.item() * int(retain_mask.sum())
+                epoch_retain_count += int(retain_mask.sum())
+            if forget_mask.any():
+                epoch_forget_loss += forget_loss.item() * int(forget_mask.sum())
+                epoch_forget_count += int(forget_mask.sum())
+
             global_step += 1
             if global_step % config.eval_every_n_batches == 0:
-                periodic = evaluate_safety_by_kind(model, safety_test_loader, device)
-                _append_safety_rows(
-                    safety_rows,
-                    periodic,
-                    step=global_step,
-                    epoch=epoch,
-                )
+                _run_eval(model, step=global_step, epoch=epoch, **eval_kwargs)
+                model.train()
 
-        retain_train_loss = evaluate_average_loss(
-            model, retain_train_eval_loader, device
-        )
-        forget_train_loss = evaluate_average_loss(
-            model, forget_train_eval_loader, device
-        )
-        cifar_metrics = evaluate_overall_and_per_class(model, cifar_test_loader, device)
-        _append_cifar_class_rows(cifar_class_rows, cifar_metrics, epoch=epoch)
         avg_retain = epoch_retain_loss / max(epoch_retain_count, 1)
         avg_forget = epoch_forget_loss / max(epoch_forget_count, 1)
         print(
             f"Epoch {epoch}/{config.epochs} - "
             f"retain_loss={avg_retain:.4f}, "
-            f"forget_loss={avg_forget:.4f}, "
-            f"eval_retain_loss={retain_train_loss:.4f}, "
-            f"eval_forget_loss={forget_train_loss:.4f}, "
-            f"test_acc={cifar_metrics['accuracy']:.2%}, "
-            f"lr={optimizer.param_groups[0]['lr']:.2e}"
+            f"forget_loss={avg_forget:.4f}"
         )
+
+    _run_eval(model, step=global_step, epoch=config.epochs, **eval_kwargs)
 
     safety_df = pl.DataFrame(safety_rows)
     cifar_class_df = pl.DataFrame(cifar_class_rows)
     safety_csv_path = experiment_dir / "safety_periodic_metrics.csv"
-    cifar_class_csv_path = experiment_dir / "cifar_class_epoch_metrics.csv"
+    cifar_class_csv_path = experiment_dir / "cifar_class_metrics.csv"
     safety_df.write_csv(safety_csv_path)
     cifar_class_df.write_csv(cifar_class_csv_path)
 
@@ -458,9 +485,10 @@ def main() -> None:
         metric="loss",
         save_path=experiment_dir / "safety_loss_by_kind.png",
     )
-    plot_cifar_class_accuracy_by_epoch(
+    plot_unlearn_pareto(
         cifar_class_df,
-        save_path=experiment_dir / "cifar_test_class_accuracy_by_epoch.png",
+        dangerous_class=config.dangerous_class,
+        save_path=experiment_dir / "unlearn_pareto.png",
     )
 
     model_path = experiment_dir / "unlearned_model.pt"
@@ -472,4 +500,33 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    base_config = UnlearnConfig()
+
+    mode_pairs: list[tuple[SplitMode, SplitMode, str]] = [
+        ("safe", "dang", "safe_unsafe"),
+        ("safe+unk", "dang", "safe+unk_unsafe"),
+        ("safe", "dang+unk", "safe_unsafe+unk"),
+    ]
+    labeled_percents = [1, 5, 10, 25, 50]
+
+    configs: list[UnlearnConfig] = []
+    for retain_mode, forget_mode, mode_label in mode_pairs:
+        for known_percent in labeled_percents:
+            configs.append(
+                UnlearnConfig(
+                    **{
+                        **asdict(base_config),
+                        "name": f"{mode_label}_{known_percent}p",
+                        "known_percent": float(known_percent),
+                        "retain_mode": retain_mode,
+                        "forget_mode": forget_mode,
+                    }
+                )
+            )
+
+    print(f"Running {len(configs)} experiments")
+    for i, config in enumerate(configs, 1):
+        print(f"\n{'='*60}")
+        print(f"[{i}/{len(configs)}] {config.name}")
+        print(f"{'='*60}")
+        main(config)

@@ -29,13 +29,14 @@ SplitMode = Literal["safe", "safe+unk", "dang", "dang+unk"]
 class UnlearnConfig:
     name: str | None = None
     seed: int = 42
-    epochs: int = 20
+    max_steps: int = 5000
     lr: float = 1e-5
     weight_decay: float = 0.0
     neggrad_forget_weight: float = 5e-5
     max_grad_norm: float = 1.0
     batch_size: int = 128
-    eval_every_n_batches: int = 128
+    eval_every_n_steps: int = 250
+    log_every_n_steps: int = 500
     safety_eval_n_per_kind: int = 50
 
     data_root: str = "data"
@@ -153,13 +154,11 @@ def _append_safety_rows(
     metrics: dict[str, float],
     *,
     step: int,
-    epoch: int,
 ) -> None:
     for kind in ALL_KINDS:
         rows.append(
             {
                 "step": float(step),
-                "epoch": float(epoch),
                 "kind": kind,
                 "count": metrics[f"{kind}/count"],
                 "loss": metrics[f"{kind}/loss"],
@@ -224,6 +223,7 @@ def plot_unlearn_pareto(
     save_path: Path,
 ) -> None:
     import matplotlib.colors as mcolors
+    from matplotlib.colors import LinearSegmentedColormap
 
     steps = sorted(df["step"].unique().to_list())
     other_acc_pct: list[float] = []
@@ -237,7 +237,7 @@ def plot_unlearn_pareto(
         forget_quality_pct.append((1.0 - float(dang)) * 100)
 
     norm = mcolors.Normalize(vmin=min(steps), vmax=max(steps))
-    cmap = plt.get_cmap("cool")
+    cmap = LinearSegmentedColormap.from_list("blues", ["#b3d4fc", "#08306b"])
 
     fig, ax = plt.subplots(figsize=(7, 7))
 
@@ -254,7 +254,7 @@ def plot_unlearn_pareto(
         other_acc_pct,
         forget_quality_pct,
         c=steps,
-        cmap="cool",
+        cmap=cmap,
         norm=norm,
         s=50,
         edgecolors="white",
@@ -284,12 +284,11 @@ def _run_eval(
     safety_eval_loader: DataLoader,
     device: torch.device,
     step: int,
-    epoch: int,
     safety_rows: list[dict[str, float | str]],
     cifar_class_rows: list[dict[str, float | str]],
 ) -> dict[str, float]:
     safety_metrics = evaluate_safety_by_kind(model, safety_eval_loader, device)
-    _append_safety_rows(safety_rows, safety_metrics, step=step, epoch=epoch)
+    _append_safety_rows(safety_rows, safety_metrics, step=step)
     cifar_metrics = evaluate_overall_and_per_class(model, cifar_test_loader, device)
     _append_cifar_class_rows(cifar_class_rows, cifar_metrics, step=step)
     return cifar_metrics
@@ -300,15 +299,14 @@ def main(config: UnlearnConfig) -> None:
     device = get_device()
 
     print(f"Using device: {device}")
-    print("NegGrad unlearning hyperparameters (joint; no alternation):")
-    print(f"  epochs: {config.epochs}")
-    print(f"  optimizer: Adam (constant LR, no scheduler)")
+    print("NegGrad unlearning config:")
+    print(f"  max_steps: {config.max_steps}")
     print(f"  lr: {config.lr}")
     print(f"  weight_decay: {config.weight_decay}")
     print(f"  neggrad_forget_weight: {config.neggrad_forget_weight}")
     print(f"  max_grad_norm: {config.max_grad_norm}")
     print(f"  batch_size: {config.batch_size}")
-    print(f"  eval_every_n_batches: {config.eval_every_n_batches}")
+    print(f"  eval_every_n_steps: {config.eval_every_n_steps}")
     print(f"  known_percent: {config.known_percent}")
     print(f"  retain_mode: {config.retain_mode}")
     print(f"  forget_mode: {config.forget_mode}")
@@ -330,12 +328,8 @@ def main(config: UnlearnConfig) -> None:
     print(f"Experiment dir: {experiment_dir}")
 
     eval_transform = get_eval_transform()
-    cifar_train = CIFAR10(
-        train=True, root=config.data_root, transform=eval_transform
-    )
-    cifar_test = CIFAR10(
-        train=False, root=config.data_root, transform=eval_transform
-    )
+    cifar_train = CIFAR10(train=True, root=config.data_root, transform=eval_transform)
+    cifar_test = CIFAR10(train=False, root=config.data_root, transform=eval_transform)
     safety_dataset = CIFAR10Safety.from_cifar10(
         cifar_train,
         dangerous_class=config.dangerous_class,
@@ -359,6 +353,7 @@ def main(config: UnlearnConfig) -> None:
         train_subset,
         batch_size=config.batch_size,
         shuffle=True,
+        drop_last=True,
         num_workers=0,
     )
     safety_eval_loader = DataLoader(
@@ -375,7 +370,8 @@ def main(config: UnlearnConfig) -> None:
     )
 
     n_retain = sum(
-        1 for idx in train_subset.indices
+        1
+        for idx in train_subset.indices
         for base_idx in [train_subset.dataset.indices[idx]]
         if str(safety_dataset.kind_arr[base_idx]) in retain_kinds
     )
@@ -411,62 +407,71 @@ def main(config: UnlearnConfig) -> None:
         cifar_class_rows=cifar_class_rows,
     )
 
-    _run_eval(model, step=0, epoch=0, **eval_kwargs)
+    _run_eval(model, step=0, **eval_kwargs)
 
     global_step = 0
-    for epoch in range(1, config.epochs + 1):
-        model.train()
-        epoch_retain_loss = 0.0
-        epoch_forget_loss = 0.0
-        epoch_retain_count = 0
-        epoch_forget_count = 0
+    running_retain_loss = 0.0
+    running_forget_loss = 0.0
+    running_retain_count = 0
+    running_forget_count = 0
+    train_iter = iter(train_loader)
 
-        for batch in train_loader:
-            images = batch["image"].to(device)
-            labels = batch["label"].to(device)
-            kinds = list(batch["kind"])
+    model.train()
+    while global_step < config.max_steps:
+        try:
+            batch = next(train_iter)
+        except StopIteration:
+            train_iter = iter(train_loader)
+            batch = next(train_iter)
 
-            retain_mask = torch.tensor(
-                [str(k) in retain_kinds for k in kinds],
-                dtype=torch.bool,
-                device=device,
-            )
-            forget_mask = ~retain_mask
+        images = batch["image"].to(device)
+        labels = batch["label"].to(device)
+        kinds = list(batch["kind"])
 
-            optimizer.zero_grad()
-            logits = model(images)
-            per_sample_loss = criterion(logits, labels)
-
-            zero = torch.tensor(0.0, device=device)
-            retain_loss = per_sample_loss[retain_mask].mean() if retain_mask.any() else zero
-            forget_loss = per_sample_loss[forget_mask].mean() if forget_mask.any() else zero
-            loss = retain_loss - config.neggrad_forget_weight * forget_loss
-
-            loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm)
-            optimizer.step()
-
-            if retain_mask.any():
-                epoch_retain_loss += retain_loss.item() * int(retain_mask.sum())
-                epoch_retain_count += int(retain_mask.sum())
-            if forget_mask.any():
-                epoch_forget_loss += forget_loss.item() * int(forget_mask.sum())
-                epoch_forget_count += int(forget_mask.sum())
-
-            global_step += 1
-            if global_step % config.eval_every_n_batches == 0:
-                _run_eval(model, step=global_step, epoch=epoch, **eval_kwargs)
-                model.train()
-
-        avg_retain = epoch_retain_loss / max(epoch_retain_count, 1)
-        avg_forget = epoch_forget_loss / max(epoch_forget_count, 1)
-        print(
-            f"Epoch {epoch}/{config.epochs} - "
-            f"retain_loss={avg_retain:.4f}, "
-            f"forget_loss={avg_forget:.4f}"
+        retain_mask = torch.tensor(
+            [str(k) in retain_kinds for k in kinds],
+            dtype=torch.bool,
+            device=device,
         )
+        forget_mask = ~retain_mask
 
-    _run_eval(model, step=global_step, epoch=config.epochs, **eval_kwargs)
+        optimizer.zero_grad()
+        logits = model(images)
+        per_sample_loss = criterion(logits, labels)
+
+        zero = torch.tensor(0.0, device=device)
+        retain_loss = per_sample_loss[retain_mask].mean() if retain_mask.any() else zero
+        forget_loss = per_sample_loss[forget_mask].mean() if forget_mask.any() else zero
+        loss = retain_loss - config.neggrad_forget_weight * forget_loss
+
+        loss.backward()
+        nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm)
+        optimizer.step()
+
+        if retain_mask.any():
+            running_retain_loss += retain_loss.item() * int(retain_mask.sum())
+            running_retain_count += int(retain_mask.sum())
+        if forget_mask.any():
+            running_forget_loss += forget_loss.item() * int(forget_mask.sum())
+            running_forget_count += int(forget_mask.sum())
+
+        global_step += 1
+
+        if global_step % config.log_every_n_steps == 0:
+            avg_r = running_retain_loss / max(running_retain_count, 1)
+            avg_f = running_forget_loss / max(running_forget_count, 1)
+            print(
+                f"Step {global_step}/{config.max_steps} - "
+                f"retain_loss={avg_r:.4f}, forget_loss={avg_f:.4f}"
+            )
+            running_retain_loss = running_forget_loss = 0.0
+            running_retain_count = running_forget_count = 0
+
+        if global_step % config.eval_every_n_steps == 0:
+            _run_eval(model, step=global_step, **eval_kwargs)
+            model.train()
+
+    _run_eval(model, step=global_step, **eval_kwargs)
 
     safety_df = pl.DataFrame(safety_rows)
     cifar_class_df = pl.DataFrame(cifar_class_rows)
@@ -503,20 +508,20 @@ if __name__ == "__main__":
     base_config = UnlearnConfig()
 
     mode_pairs: list[tuple[SplitMode, SplitMode, str]] = [
-        ("safe", "dang", "safe_unsafe"),
-        ("safe+unk", "dang", "safe+unk_unsafe"),
-        ("safe", "dang+unk", "safe_unsafe+unk"),
+        ("safe", "dang"),
+        ("safe+unk", "dang"),
+        ("safe", "dang+unk"),
     ]
     labeled_percents = [1, 5, 10, 25, 50]
 
     configs: list[UnlearnConfig] = []
-    for retain_mode, forget_mode, mode_label in mode_pairs:
+    for retain_mode, forget_mode in mode_pairs:
         for known_percent in labeled_percents:
             configs.append(
                 UnlearnConfig(
                     **{
                         **asdict(base_config),
-                        "name": f"{mode_label}_{known_percent}p",
+                        "name": f"{retain_mode}_{forget_mode}_{known_percent}p",
                         "known_percent": float(known_percent),
                         "retain_mode": retain_mode,
                         "forget_mode": forget_mode,
@@ -526,7 +531,7 @@ if __name__ == "__main__":
 
     print(f"Running {len(configs)} experiments")
     for i, config in enumerate(configs, 1):
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         print(f"[{i}/{len(configs)}] {config.name}")
-        print(f"{'='*60}")
+        print(f"{'=' * 60}")
         main(config)

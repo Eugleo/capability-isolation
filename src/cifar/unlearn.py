@@ -471,7 +471,8 @@ def main(config: UnlearnConfig) -> None:
             _run_eval(model, step=global_step, **eval_kwargs)
             model.train()
 
-    _run_eval(model, step=global_step, **eval_kwargs)
+    if global_step % config.eval_every_n_steps != 0:
+        _run_eval(model, step=global_step, **eval_kwargs)
 
     safety_df = pl.DataFrame(safety_rows)
     cifar_class_df = pl.DataFrame(cifar_class_rows)

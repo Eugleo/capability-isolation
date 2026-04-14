@@ -231,63 +231,6 @@ class CIFAR10Safety(Dataset):
             "kind": kind,
         }
 
-    def train_test_split_indices_by_kind(
-        self,
-        *,
-        test_percent: float = 10.0,
-        seed: int | None = None,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        if not (0.0 <= test_percent <= 100.0):
-            raise ValueError(f"test_percent must be in [0, 100], got {test_percent}")
-
-        rng = np.random.RandomState(self.seed if seed is None else seed)
-        train_parts: list[np.ndarray] = []
-        test_parts: list[np.ndarray] = []
-
-        for kind in ("k-safe", "k-dang", "u-safe", "u-dang"):
-            kind_indices = np.flatnonzero(self.kind_arr == kind)
-            if len(kind_indices) == 0:
-                continue
-
-            shuffled = kind_indices.copy()
-            rng.shuffle(shuffled)
-
-            n_test = int(round((test_percent / 100.0) * len(shuffled)))
-            n_test = max(0, min(n_test, len(shuffled)))
-            test_parts.append(shuffled[:n_test])
-            train_parts.append(shuffled[n_test:])
-
-        train_idx = (
-            np.concatenate(train_parts).astype(np.int64)
-            if train_parts
-            else np.empty(0, dtype=np.int64)
-        )
-        test_idx = (
-            np.concatenate(test_parts).astype(np.int64)
-            if test_parts
-            else np.empty(0, dtype=np.int64)
-        )
-
-        # Keep deterministic ordering after stratified sampling.
-        train_idx.sort()
-        test_idx.sort()
-        return train_idx, test_idx
-
-    def train_test_subsets_by_kind(
-        self,
-        *,
-        test_percent: float = 10.0,
-        seed: int | None = None,
-    ) -> tuple[Subset["CIFAR10Safety"], Subset["CIFAR10Safety"]]:
-        train_idx, test_idx = self.train_test_split_indices_by_kind(
-            test_percent=test_percent,
-            seed=seed,
-        )
-        return (
-            Subset(self, train_idx.tolist()),
-            Subset(self, test_idx.tolist()),
-        )
-
 
 def _load_and_validate_cscores(
     *,

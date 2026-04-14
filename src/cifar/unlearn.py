@@ -28,20 +28,21 @@ SplitMode = Literal["safe", "safe+unk", "dang", "dang+unk"]
 @dataclass
 class UnlearnConfig:
     seed: int = 42
-    epochs: int = 10
+    epochs: int = 20
     lr: float = 1e-5
     weight_decay: float = 0.0
-    neggrad_forget_weight: float = 0.001
+    neggrad_forget_weight: float = 0.01
+    max_grad_norm: float = 1.0
     batch_size: int = 128
-    eval_every_n_batches: int = 64
+    eval_every_n_batches: int = 128
     safety_test_percent: float = 10.0
 
     data_root: str = "data"
     dangerous_class: str = "airplane"
     safe_known: str = "atypical"
     dangerous_known: str = "atypical"
-    known_percent: float = 90.0
-    retain_mode: SplitMode = "safe+unk"
+    known_percent: float = 75
+    retain_mode: SplitMode = "safe"
     forget_mode: SplitMode = "dang"
 
     pretrained_model_path: str = "checkpoints/cifar/train_resnet.pt"
@@ -248,6 +249,7 @@ def main() -> None:
     print(f"  lr: {config.lr}")
     print(f"  weight_decay: {config.weight_decay}")
     print(f"  neggrad_forget_weight: {config.neggrad_forget_weight}")
+    print(f"  max_grad_norm: {config.max_grad_norm}")
     print(f"  batch_size: {config.batch_size}")
     print(f"  eval_every_n_batches: {config.eval_every_n_batches}")
     print(f"  known_percent: {config.known_percent}")
@@ -405,6 +407,7 @@ def main() -> None:
                 epoch_forget_count += int(forget_mask.sum())
 
             loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm)
             optimizer.step()
 
             epoch_loss += loss.item()

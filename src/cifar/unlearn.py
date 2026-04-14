@@ -28,9 +28,10 @@ SplitMode = Literal["safe", "safe+unk", "dang", "dang+unk"]
 @dataclass
 class UnlearnConfig:
     seed: int = 42
-    epochs: int = 100
+    epochs: int = 10
     lr: float = 1e-5
-    weight_decay: float = 1e-3
+    weight_decay: float = 0.0
+    neggrad_forget_weight: float = 0.001
     batch_size: int = 128
     eval_every_n_batches: int = 64
     safety_test_percent: float = 10.0
@@ -66,6 +67,7 @@ def _mode_to_kinds(mode: SplitMode) -> tuple[SafetyKind, ...]:
         return ("k-dang",)
     if mode == "dang+unk":
         return ("k-dang", "u-safe", "u-dang")
+    raise ValueError(f"Unknown mode: {mode}")
 
 
 def _build_mode_subset(
@@ -240,11 +242,12 @@ def main() -> None:
     device = get_device()
 
     print(f"Using device: {device}")
-    print("Catastrophic forgetting hyperparameters:")
+    print("NegGrad unlearning hyperparameters (joint; no alternation):")
     print(f"  epochs: {config.epochs}")
-    print(f"  optimizer: Adam")
+    print(f"  optimizer: Adam (constant LR, no scheduler)")
     print(f"  lr: {config.lr}")
     print(f"  weight_decay: {config.weight_decay}")
+    print(f"  neggrad_forget_weight: {config.neggrad_forget_weight}")
     print(f"  batch_size: {config.batch_size}")
     print(f"  eval_every_n_batches: {config.eval_every_n_batches}")
     print(f"  known_percent: {config.known_percent}")
@@ -285,11 +288,19 @@ def main() -> None:
         test_percent=config.safety_test_percent,
         seed=config.seed,
     )
+
+    # Build retain/forget subsets only for eval monitoring.
     retain_train_subset = _build_mode_subset(safety_train_subset, retain_kinds)
     forget_train_subset = _build_mode_subset(safety_train_subset, forget_kinds)
+    if len(forget_train_subset) == 0:
+        raise ValueError(
+            "NegGrad requires a non-empty forget subset. "
+            "Adjust forget_mode/split settings."
+        )
 
-    retain_train_loader = DataLoader(
-        retain_train_subset,
+    # Single shuffled training loader over ALL training examples.
+    train_loader = DataLoader(
+        safety_train_subset,
         batch_size=config.batch_size,
         shuffle=True,
         num_workers=0,
@@ -312,17 +323,18 @@ def main() -> None:
         shuffle=False,
         num_workers=0,
     )
-    print(
-        "Split sizes - "
-        f"retain_train={len(retain_train_subset)}, "
-        f"forget_train={len(forget_train_subset)}, "
-        f"safety_test={len(safety_test_subset)}"
-    )
     cifar_test_loader = DataLoader(
         cifar_test_dataset,
         batch_size=config.batch_size,
         shuffle=False,
         num_workers=0,
+    )
+
+    print(
+        "Split sizes - "
+        f"train={len(safety_train_subset)} "
+        f"(retain={len(retain_train_subset)}, forget={len(forget_train_subset)}), "
+        f"safety_test={len(safety_test_subset)}"
     )
 
     model = build_cifar_resnet18().to(device)
@@ -339,17 +351,11 @@ def main() -> None:
         lr=config.lr,
         weight_decay=config.weight_decay,
     )
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=config.epochs,
-        eta_min=config.lr * 0.1,
-    )
-    criterion = nn.CrossEntropyLoss()
+    criterion = nn.CrossEntropyLoss(reduction="none")
 
     safety_rows: list[dict[str, float | str]] = []
     cifar_class_rows: list[dict[str, float | str]] = []
 
-    # Baseline evaluation before any unlearning updates.
     baseline_safety = evaluate_safety_by_kind(model, safety_test_loader, device)
     _append_safety_rows(safety_rows, baseline_safety, step=0, epoch=0)
     baseline_cifar = evaluate_overall_and_per_class(model, cifar_test_loader, device)
@@ -359,22 +365,49 @@ def main() -> None:
     for epoch in range(1, config.epochs + 1):
         model.train()
         epoch_loss = 0.0
-        epoch_count = 0
+        epoch_retain_loss = 0.0
+        epoch_forget_loss = 0.0
+        epoch_retain_count = 0
+        epoch_forget_count = 0
 
-        for batch in retain_train_loader:
+        for batch in train_loader:
             images = batch["image"].to(device)
             labels = batch["label"].to(device)
+            kinds = list(batch["kind"])
+
+            retain_mask = torch.tensor(
+                [str(k) in retain_kinds for k in kinds],
+                dtype=torch.bool,
+                device=device,
+            )
+            forget_mask = torch.tensor(
+                [str(k) in forget_kinds for k in kinds],
+                dtype=torch.bool,
+                device=device,
+            )
 
             optimizer.zero_grad()
             logits = model(images)
-            loss = criterion(logits, labels)
+            per_sample_loss = criterion(logits, labels)
+
+            loss = torch.tensor(0.0, device=device)
+
+            if retain_mask.any():
+                retain_loss = per_sample_loss[retain_mask].mean()
+                loss = loss + retain_loss
+                epoch_retain_loss += retain_loss.item() * int(retain_mask.sum())
+                epoch_retain_count += int(retain_mask.sum())
+
+            if forget_mask.any():
+                forget_loss = per_sample_loss[forget_mask].mean()
+                loss = loss - config.neggrad_forget_weight * forget_loss
+                epoch_forget_loss += forget_loss.item() * int(forget_mask.sum())
+                epoch_forget_count += int(forget_mask.sum())
+
             loss.backward()
             optimizer.step()
 
-            batch_size = labels.size(0)
-            epoch_loss += loss.item() * batch_size
-            epoch_count += batch_size
-
+            epoch_loss += loss.item()
             global_step += 1
             if global_step % config.eval_every_n_batches == 0:
                 periodic = evaluate_safety_by_kind(model, safety_test_loader, device)
@@ -385,8 +418,6 @@ def main() -> None:
                     epoch=epoch,
                 )
 
-        scheduler.step()
-        avg_loss = epoch_loss / max(epoch_count, 1)
         retain_train_loss = evaluate_average_loss(
             model, retain_train_eval_loader, device
         )
@@ -395,11 +426,14 @@ def main() -> None:
         )
         cifar_metrics = evaluate_overall_and_per_class(model, cifar_test_loader, device)
         _append_cifar_class_rows(cifar_class_rows, cifar_metrics, epoch=epoch)
+        avg_retain = epoch_retain_loss / max(epoch_retain_count, 1)
+        avg_forget = epoch_forget_loss / max(epoch_forget_count, 1)
         print(
             f"Epoch {epoch}/{config.epochs} - "
-            f"train_loss={avg_loss:.4f}, "
-            f"retain_train_loss={retain_train_loss:.4f}, "
-            f"forget_train_loss={forget_train_loss:.4f}, "
+            f"retain_loss={avg_retain:.4f}, "
+            f"forget_loss={avg_forget:.4f}, "
+            f"eval_retain_loss={retain_train_loss:.4f}, "
+            f"eval_forget_loss={forget_train_loss:.4f}, "
             f"test_acc={cifar_metrics['accuracy']:.2%}, "
             f"lr={optimizer.param_groups[0]['lr']:.2e}"
         )

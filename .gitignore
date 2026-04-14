@@ -13,3 +13,7 @@ wheels/
 checkpoints/
 data/
 experiments/
+
+checkpoints
+data
+experiments

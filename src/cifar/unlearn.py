@@ -31,7 +31,7 @@ class UnlearnConfig:
     epochs: int = 20
     lr: float = 1e-5
     weight_decay: float = 0.0
-    neggrad_forget_weight: float = 0.01
+    neggrad_forget_weight: float = 5e-5
     max_grad_norm: float = 1.0
     batch_size: int = 128
     eval_every_n_batches: int = 128

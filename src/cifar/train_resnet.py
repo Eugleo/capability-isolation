@@ -33,7 +33,7 @@ CIFAR_CLASS_NAMES: dict[CifarVariant, tuple[str, ...]] = {
 class TrainResNetConfig:
     dataset: CifarVariant = "cifar100"
     seed: int = 42
-    epochs: int = 5
+    epochs: int = 300
     lr: float = 1e-4
     weight_decay: float = 1e-4
     batch_size: int = 128

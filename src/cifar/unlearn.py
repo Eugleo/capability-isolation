@@ -24,7 +24,7 @@ from src.cifar.train_resnet import (
     CIFAR_NUM_CLASSES,
     CifarVariant,
     build_cifar_resnet18,
-    evaluate_overall_and_per_class,
+    evaluate_per_class,
     get_eval_transform,
     validate_known_policy,
 )
@@ -105,89 +105,57 @@ def _build_mode_subset(
     return Subset(subset, selected_positions)
 
 
-def _sample_safety_eval_subset(
+def _build_safety_eval_loaders(
     dataset: SafetyDataset,
     *,
     n_per_kind: int,
+    batch_size: int,
     seed: int,
-) -> Subset[SafetyDataset]:
+) -> dict[SafetyKind, DataLoader]:
     import numpy as np
 
     rng = np.random.RandomState(seed)
-    selected: list[int] = []
+    loaders: dict[SafetyKind, DataLoader] = {}
     for kind in ALL_KINDS:
         kind_indices = np.flatnonzero(dataset.kind_arr == kind)
         if len(kind_indices) == 0:
             continue
         n = min(n_per_kind, len(kind_indices))
-        selected.extend(rng.choice(kind_indices, size=n, replace=False).tolist())
-    selected.sort()
-    return Subset(dataset, selected)
+        selected = sorted(rng.choice(kind_indices, size=n, replace=False).tolist())
+        loaders[kind] = DataLoader(
+            Subset(dataset, selected),
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=0,
+        )
+    return loaders
 
 
-@torch.no_grad()
-def evaluate_safety_by_kind(
-    model: nn.Module, loader: DataLoader, device: torch.device
+def _aggregate_metrics(
+    metrics: dict[str, dict[str, float]],
 ) -> dict[str, float]:
-    model.eval()
-    criterion = nn.CrossEntropyLoss(reduction="none")
-
-    kind_loss_sum = {kind: 0.0 for kind in ALL_KINDS}
-    kind_correct = {kind: 0 for kind in ALL_KINDS}
-    kind_count = {kind: 0 for kind in ALL_KINDS}
-
-    for batch in loader:
-        images = batch["image"].to(device)
-        labels = batch["label"].to(device)
-        kinds = list(batch["kind"])
-
-        logits = model(images)
-        loss_per_sample = criterion(logits, labels)
-        preds = logits.argmax(dim=1)
-        correct = preds.eq(labels)
-
-        for i, kind_raw in enumerate(kinds):
-            kind = str(kind_raw)
-            if kind not in kind_count:
-                continue
-            kind_loss_sum[kind] += float(loss_per_sample[i].item())
-            kind_correct[kind] += int(correct[i].item())
-            kind_count[kind] += 1
-
-    metrics: dict[str, float] = {}
-    for kind in ALL_KINDS:
-        count = kind_count[kind]
-        metrics[f"{kind}/count"] = float(count)
-        metrics[f"{kind}/loss"] = (
-            kind_loss_sum[kind] / count if count > 0 else float("nan")
-        )
-        metrics[f"{kind}/accuracy"] = (
-            kind_correct[kind] / count if count > 0 else float("nan")
-        )
-    return metrics
-
-
-def _append_safety_rows(
-    rows: list[dict[str, float | str]],
-    metrics: dict[str, float],
-    *,
-    step: int,
-) -> None:
-    for kind in ALL_KINDS:
-        rows.append(
-            {
-                "step": float(step),
-                "kind": kind,
-                "count": metrics[f"{kind}/count"],
-                "loss": metrics[f"{kind}/loss"],
-                "accuracy": metrics[f"{kind}/accuracy"],
-            }
-        )
+    """Weighted-average per-class metrics into a single set of scalars."""
+    counts = metrics["count"]
+    active = [c for c, n in counts.items() if n > 0]
+    total = sum(counts[c] for c in active)
+    if total == 0:
+        return {
+            "top1_acc": float("nan"),
+            "top5_acc": float("nan"),
+            "loss": float("nan"),
+            "count": 0.0,
+        }
+    return {
+        "top1_acc": sum(counts[c] * metrics["top1_acc"][c] for c in active) / total,
+        "top5_acc": sum(counts[c] * metrics["top5_acc"][c] for c in active) / total,
+        "loss": sum(counts[c] * metrics["loss"][c] for c in active) / total,
+        "count": total,
+    }
 
 
 def _append_cifar_class_rows(
     rows: list[dict[str, float | str]],
-    metrics: dict[str, float],
+    metrics: dict[str, dict[str, float]],
     *,
     step: int,
     class_names: tuple[str, ...],
@@ -197,11 +165,19 @@ def _append_cifar_class_rows(
             {
                 "step": float(step),
                 "class": class_name,
-                "count": metrics[f"class/{class_name}/count"],
-                "loss": metrics[f"class/{class_name}/loss"],
-                "accuracy": metrics[f"class/{class_name}/accuracy"],
+                "count": metrics["count"][class_name],
+                "loss": metrics["loss"][class_name],
+                "top1_acc": metrics["top1_acc"][class_name],
+                "top5_acc": metrics["top5_acc"][class_name],
             }
         )
+
+
+_METRIC_DISPLAY: dict[str, str] = {
+    "top1_acc": "Top-1 Accuracy",
+    "top5_acc": "Top-5 Accuracy",
+    "loss": "Loss",
+}
 
 
 def plot_safety_metric_by_kind(
@@ -210,6 +186,7 @@ def plot_safety_metric_by_kind(
     metric: str,
     save_path: Path,
 ) -> None:
+    display = _METRIC_DISPLAY.get(metric, metric)
     fig, ax = plt.subplots(figsize=(10, 6))
     for kind in ALL_KINDS:
         kind_df = df.filter(pl.col("kind") == kind).sort("step")
@@ -225,9 +202,9 @@ def plot_safety_metric_by_kind(
             linewidth=1.0,
         )
     ax.set_xlabel("Step")
-    ax.set_ylabel(metric.capitalize())
-    ax.set_title(f"Safety Test {metric.capitalize()} by Kind")
-    if metric == "accuracy":
+    ax.set_ylabel(display)
+    ax.set_title(f"Safety Test {display} by Kind")
+    if metric in ("top1_acc", "top5_acc"):
         ax.set_ylim(0, 1)
     ax.grid(True, alpha=0.3)
     ax.legend()
@@ -251,8 +228,8 @@ def plot_unlearn_pareto(
 
     for step in steps:
         step_df = df.filter(pl.col("step") == step)
-        dang = step_df.filter(pl.col("class") == dangerous_class)["accuracy"].item()
-        others = step_df.filter(pl.col("class") != dangerous_class)["accuracy"].mean()
+        dang = step_df.filter(pl.col("class") == dangerous_class)["top1_acc"].item()
+        others = step_df.filter(pl.col("class") != dangerous_class)["top1_acc"].mean()
         other_acc_pct.append(float(others) * 100)
         forget_quality_pct.append((1.0 - float(dang)) * 100)
 
@@ -301,16 +278,19 @@ def _run_eval(
     model: nn.Module,
     *,
     cifar_test_loader: DataLoader,
-    safety_eval_loader: DataLoader,
+    safety_eval_loaders: dict[SafetyKind, DataLoader],
     device: torch.device,
     step: int,
     safety_rows: list[dict[str, float | str]],
     cifar_class_rows: list[dict[str, float | str]],
     class_names: tuple[str, ...],
-) -> dict[str, float]:
-    safety_metrics = evaluate_safety_by_kind(model, safety_eval_loader, device)
-    _append_safety_rows(safety_rows, safety_metrics, step=step)
-    cifar_metrics = evaluate_overall_and_per_class(
+) -> dict[str, dict[str, float]]:
+    for kind, loader in safety_eval_loaders.items():
+        kind_per_class = evaluate_per_class(model, loader, device, class_names=class_names)
+        agg = _aggregate_metrics(kind_per_class)
+        safety_rows.append({"step": float(step), "kind": kind, **agg})
+
+    cifar_metrics = evaluate_per_class(
         model, cifar_test_loader, device, class_names=class_names
     )
     _append_cifar_class_rows(
@@ -386,9 +366,10 @@ def main(config: UnlearnConfig) -> None:
         Subset(safety_dataset, list(range(len(safety_dataset)))),
         train_kinds,
     )
-    safety_eval_subset = _sample_safety_eval_subset(
+    safety_eval_loaders = _build_safety_eval_loaders(
         safety_dataset,
         n_per_kind=config.safety_eval_n_per_kind,
+        batch_size=config.batch_size,
         seed=config.seed,
     )
 
@@ -397,12 +378,6 @@ def main(config: UnlearnConfig) -> None:
         batch_size=config.batch_size,
         shuffle=True,
         drop_last=True,
-        num_workers=0,
-    )
-    safety_eval_loader = DataLoader(
-        safety_eval_subset,
-        batch_size=config.batch_size,
-        shuffle=False,
         num_workers=0,
     )
     cifar_test_loader = DataLoader(
@@ -419,9 +394,10 @@ def main(config: UnlearnConfig) -> None:
         if str(safety_dataset.kind_arr[base_idx]) in retain_kinds
     )
     n_forget = len(train_subset) - n_retain
+    n_safety_eval = sum(len(loader.dataset) for loader in safety_eval_loaders.values())
     print(
         f"Train={len(train_subset)} (retain={n_retain}, forget={n_forget}), "
-        f"safety_eval={len(safety_eval_subset)}"
+        f"safety_eval={n_safety_eval}"
     )
 
     model = build_cifar_resnet18(num_classes=num_classes).to(device)
@@ -444,7 +420,7 @@ def main(config: UnlearnConfig) -> None:
     cifar_class_rows: list[dict[str, float | str]] = []
     eval_kwargs = dict(
         cifar_test_loader=cifar_test_loader,
-        safety_eval_loader=safety_eval_loader,
+        safety_eval_loaders=safety_eval_loaders,
         device=device,
         safety_rows=safety_rows,
         cifar_class_rows=cifar_class_rows,
@@ -527,8 +503,13 @@ def main(config: UnlearnConfig) -> None:
 
     plot_safety_metric_by_kind(
         safety_df,
-        metric="accuracy",
-        save_path=experiment_dir / "safety_accuracy_by_kind.png",
+        metric="top1_acc",
+        save_path=experiment_dir / "safety_top1_acc_by_kind.png",
+    )
+    plot_safety_metric_by_kind(
+        safety_df,
+        metric="top5_acc",
+        save_path=experiment_dir / "safety_top5_acc_by_kind.png",
     )
     plot_safety_metric_by_kind(
         safety_df,
@@ -557,7 +538,7 @@ if __name__ == "__main__":
         "retain-unknown",
         # "forget-unknown",
     ]
-    labeled_percents = [75, 90, 99]
+    labeled_percents = [1, 5, 10, 25, 50, 90, 99]
 
     configs: list[UnlearnConfig] = []
     for strategy in strategies:

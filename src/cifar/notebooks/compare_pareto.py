@@ -7,12 +7,31 @@ import matplotlib.pyplot as plt
 import polars as pl
 
 # %%
+# safe dang
+# experiment_dirs: list[str] = [
+#     "experiments/2026-04-14_21-26-34_safe_dang_1p",
+#     "experiments/2026-04-14_21-30-00_safe_dang_5p",
+#     "experiments/2026-04-14_21-33-25_safe_dang_10p",
+#     "experiments/2026-04-14_21-36-50_safe_dang_25p",
+#     "experiments/2026-04-14_21-40-14_safe_dang_50p",
+# ]
+
+# safe+unk dang
+# experiment_dirs: list[str] = [
+#     "experiments/2026-04-14_21-43-39_safe+unk_dang_1p",
+#     "experiments/2026-04-14_21-47-03_safe+unk_dang_5p",
+#     "experiments/2026-04-14_21-50-26_safe+unk_dang_10p",
+#     "experiments/2026-04-14_21-53-49_safe+unk_dang_25p",
+#     "experiments/2026-04-14_21-57-14_safe+unk_dang_50p",
+# ]
+
+# safe dang+unk
 experiment_dirs: list[str] = [
-    "experiments/2026-04-14_21-26-34_safe_dang_1p",
-    "experiments/2026-04-14_21-30-00_safe_dang_5p",
-    "experiments/2026-04-14_21-33-25_safe_dang_10p",
-    "experiments/2026-04-14_21-36-50_safe_dang_25p",
-    "experiments/2026-04-14_21-40-14_safe_dang_50p",
+    "experiments/2026-04-14_22-00-40_safe_dang+unk_1p",
+    "experiments/2026-04-14_22-04-04_safe_dang+unk_5p",
+    "experiments/2026-04-14_22-07-29_safe_dang+unk_10p",
+    "experiments/2026-04-14_22-10-54_safe_dang+unk_25p",
+    "experiments/2026-04-14_22-14-19_safe_dang+unk_50p",
 ]
 
 # %%
@@ -92,9 +111,10 @@ for i, exp in enumerate(experiments):
         zorder=2,
     )
 
-ax.set_xlabel("Other Classes Accuracy (%) \u2191", fontsize=12)
+ax.set_xlabel("\u2191 Safe Utility (acc %)", fontsize=12)
 ax.set_ylabel(
-    f"1 \u2212 {dangerous_class.capitalize()} Accuracy (%) \u2191", fontsize=12
+    f"\u2191 Dangerous Unlearning (1 \u2212 {dangerous_class} acc %)",
+    fontsize=12,
 )
 ax.set_xlim(0, 100)
 ax.set_ylim(0, 100)

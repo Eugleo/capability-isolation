@@ -14,8 +14,12 @@ from torch.utils.data import DataLoader, Subset
 
 from src.cifar.data import (
     CIFAR10,
+    CIFAR10_CLASSES,
     CIFAR100,
     CIFAR100_CLASS_TO_INDEX,
+    CIFAR100_CLASSES,
+    CIFAR100_FINE_TO_COARSE,
+    CIFAR100_SUPERCLASSES,
     CLASS_TO_INDEX,
     CIFAR10Safety,
     CIFAR100Safety,
@@ -33,11 +37,6 @@ SafetyDataset = CIFAR10Safety | CIFAR100Safety
 
 ALL_KINDS: tuple[SafetyKind, ...] = ("k-safe", "k-dang", "u-safe", "u-dang")
 KIND_TO_IDX: dict[str, int] = {k: i for i, k in enumerate(ALL_KINDS)}
-AGGREGATE_GROUPS: dict[str, tuple[SafetyKind, ...]] = {
-    "safe": ("k-safe", "u-safe"),
-    "dangerous": ("k-dang", "u-dang"),
-}
-ALL_GROUPS: tuple[str, ...] = (*ALL_KINDS, "safe", "dangerous")
 GROUP_COLORS: dict[str, str] = {
     "k-dang": "red",
     "u-dang": "orange",
@@ -54,7 +53,21 @@ GROUP_LINESTYLES: dict[str, str] = {
     "safe": "--",
     "dangerous": "--",
 }
+PER_CLASS_COLORS: tuple[str, ...] = (
+    "tab:blue",
+    "tab:orange",
+    "tab:green",
+    "tab:red",
+    "tab:purple",
+    "tab:brown",
+    "tab:pink",
+    "tab:gray",
+    "tab:olive",
+    "tab:cyan",
+)
+
 UnlearningStrategy = Literal["ignore-unknown", "retain-unknown", "forget-unknown"]
+EvalSplit = Literal["train", "test"]
 
 
 @dataclass
@@ -75,6 +88,9 @@ class UnlearnConfig:
     dangerous_classes: tuple[str, ...] = ("man", "boy")
     unknown_classes: tuple[str, ...] = ("girl", "boy")
     unlearning_strategy: UnlearningStrategy = "ignore-unknown"
+
+    eval_split: EvalSplit = "train"
+    eval_superclass: str | None = "people"
 
     pretrained_model_path: str = "checkpoints/cifar100/train_resnet.pt"
     experiments_root: str = "experiments"
@@ -117,65 +133,46 @@ def _build_mode_subset(
     return Subset(subset, selected_positions)
 
 
-def _metrics_for(c: int, t1: int, t5: int, ls: float) -> dict[str, float]:
-    if c > 0:
-        return {
-            "top1_acc": t1 / c,
-            "top5_acc": t5 / c,
-            "loss": ls / c,
-            "count": float(c),
-        }
-    return {
-        "top1_acc": float("nan"),
-        "top5_acc": float("nan"),
-        "loss": float("nan"),
-        "count": 0.0,
-    }
+def _class_to_kind(
+    class_idx: int,
+    *,
+    dangerous_idxs: set[int],
+    unknown_idxs: set[int],
+) -> SafetyKind:
+    is_dangerous = class_idx in dangerous_idxs
+    is_known = class_idx not in unknown_idxs
+    if is_known and not is_dangerous:
+        return "k-safe"
+    if is_known and is_dangerous:
+        return "k-dang"
+    if not is_known and not is_dangerous:
+        return "u-safe"
+    return "u-dang"
 
 
 @torch.no_grad()
-def _eval_by_kind(
+def _eval_per_class(
     model: nn.Module,
     loader: DataLoader,
     device: torch.device,
-    *,
-    dangerous_class_idxs: set[int] | None = None,
-) -> tuple[dict[str, dict[str, float]], dict[str, dict[str, float]]]:
-    """Evaluate model on safety dataset.
+    num_classes: int,
+) -> dict[str, torch.Tensor]:
+    """Per-class evaluation in a single pass.
 
-    Returns (global_metrics, dclass_metrics).  *global_metrics* contains
-    per-kind and safe/dangerous aggregate entries.  *dclass_metrics* contains
-    per-kind entries restricted to examples whose CIFAR label is in
-    ``dangerous_class_idxs`` (empty dict when the arg is ``None``).
+    Returns dict of tensors, each of shape ``(num_classes,)``:
+    count, top1, top5, loss.
     """
     model.eval()
     criterion = nn.CrossEntropyLoss(reduction="none")
-    n_kinds = len(ALL_KINDS)
 
-    counts = torch.zeros(n_kinds, dtype=torch.long, device=device)
-    correct_top1 = torch.zeros(n_kinds, dtype=torch.long, device=device)
-    correct_top5 = torch.zeros(n_kinds, dtype=torch.long, device=device)
-    loss_sum = torch.zeros(n_kinds, dtype=torch.double, device=device)
-
-    track_dclass = dangerous_class_idxs is not None and len(dangerous_class_idxs) > 0
-    dc_label_tensor = (
-        torch.tensor(sorted(dangerous_class_idxs), device=device)
-        if track_dclass
-        else None
-    )
-    dc_counts = torch.zeros(n_kinds, dtype=torch.long, device=device)
-    dc_top1 = torch.zeros(n_kinds, dtype=torch.long, device=device)
-    dc_top5 = torch.zeros(n_kinds, dtype=torch.long, device=device)
-    dc_loss = torch.zeros(n_kinds, dtype=torch.double, device=device)
+    counts = torch.zeros(num_classes, dtype=torch.long, device=device)
+    correct_top1 = torch.zeros(num_classes, dtype=torch.long, device=device)
+    correct_top5 = torch.zeros(num_classes, dtype=torch.long, device=device)
+    loss_sum = torch.zeros(num_classes, dtype=torch.double, device=device)
 
     for batch in loader:
         images = batch["image"].to(device)
         labels = batch["label"].to(device)
-        kind_indices = torch.tensor(
-            [KIND_TO_IDX[str(k)] for k in batch["kind"]],
-            dtype=torch.long,
-            device=device,
-        )
 
         logits = model(images)
         per_loss = criterion(logits, labels)
@@ -183,58 +180,128 @@ def _eval_by_kind(
         k = min(5, logits.size(1))
         top5_hit = logits.topk(k, dim=1).indices.eq(labels.unsqueeze(1)).any(dim=1)
 
-        ones = torch.ones_like(kind_indices)
-        counts.scatter_add_(0, kind_indices, ones)
-        correct_top1.scatter_add_(0, kind_indices, top1_hit.long())
-        correct_top5.scatter_add_(0, kind_indices, top5_hit.long())
-        loss_sum.scatter_add_(0, kind_indices, per_loss.double())
+        counts.scatter_add_(0, labels, torch.ones_like(labels))
+        correct_top1.scatter_add_(0, labels, top1_hit.long())
+        correct_top5.scatter_add_(0, labels, top5_hit.long())
+        loss_sum.scatter_add_(0, labels, per_loss.double())
 
-        if track_dclass:
-            dc_mask = torch.isin(labels, dc_label_tensor)
-            if dc_mask.any():
-                dc_ki = kind_indices[dc_mask]
-                dc_counts.scatter_add_(0, dc_ki, torch.ones_like(dc_ki))
-                dc_top1.scatter_add_(0, dc_ki, top1_hit[dc_mask].long())
-                dc_top5.scatter_add_(0, dc_ki, top5_hit[dc_mask].long())
-                dc_loss.scatter_add_(0, dc_ki, per_loss[dc_mask].double())
+    return {
+        "count": counts.cpu(),
+        "top1": correct_top1.cpu(),
+        "top5": correct_top5.cpu(),
+        "loss": loss_sum.cpu(),
+    }
 
-    counts_cpu = counts.cpu()
-    top1_cpu = correct_top1.cpu()
-    top5_cpu = correct_top5.cpu()
-    loss_cpu = loss_sum.cpu()
 
-    result: dict[str, dict[str, float]] = {}
-    for idx, kind in enumerate(ALL_KINDS):
-        result[kind] = _metrics_for(
-            int(counts_cpu[idx]),
-            int(top1_cpu[idx]),
-            int(top5_cpu[idx]),
-            float(loss_cpu[idx]),
+def _build_per_class_rows(
+    stats: dict[str, torch.Tensor],
+    *,
+    step: int,
+    class_names: tuple[str, ...],
+    kind_map: dict[int, SafetyKind],
+    fine_to_coarse: dict[int, int] | None,
+    superclass_names: tuple[str, ...] | None,
+) -> list[dict]:
+    rows: list[dict] = []
+    for ci in range(len(class_names)):
+        c = int(stats["count"][ci])
+        t1 = int(stats["top1"][ci])
+        t5 = int(stats["top5"][ci])
+        ls = float(stats["loss"][ci])
+        row: dict = {
+            "step": step,
+            "class_idx": ci,
+            "class_name": class_names[ci],
+            "kind": kind_map[ci],
+            "count": c,
+            "top1_correct": t1,
+            "top5_correct": t5,
+            "loss_sum": ls,
+            "top1_acc": t1 / c if c > 0 else float("nan"),
+            "top5_acc": t5 / c if c > 0 else float("nan"),
+            "loss": ls / c if c > 0 else float("nan"),
+        }
+        if fine_to_coarse is not None and superclass_names is not None:
+            row["superclass"] = superclass_names[fine_to_coarse[ci]]
+        rows.append(row)
+    return rows
+
+
+def _aggregate(df: pl.DataFrame, group_col: str) -> pl.DataFrame:
+    """Aggregate per-class rows by *group_col*, computing weighted metrics."""
+    return (
+        df.group_by("step", group_col)
+        .agg(
+            pl.col("count").sum(),
+            pl.col("top1_correct").sum(),
+            pl.col("top5_correct").sum(),
+            pl.col("loss_sum").sum(),
         )
+        .with_columns(
+            pl.when(pl.col("count") > 0)
+            .then(pl.col("top1_correct") / pl.col("count"))
+            .otherwise(pl.lit(float("nan")))
+            .alias("top1_acc"),
+            pl.when(pl.col("count") > 0)
+            .then(pl.col("top5_correct") / pl.col("count"))
+            .otherwise(pl.lit(float("nan")))
+            .alias("top5_acc"),
+            pl.when(pl.col("count") > 0)
+            .then(pl.col("loss_sum") / pl.col("count"))
+            .otherwise(pl.lit(float("nan")))
+            .alias("loss"),
+        )
+        .sort("step", group_col)
+    )
 
-    for group_name, member_kinds in AGGREGATE_GROUPS.items():
-        member_idxs = [KIND_TO_IDX[k] for k in member_kinds]
-        total_c = sum(int(counts_cpu[i]) for i in member_idxs)
-        total_t1 = sum(int(top1_cpu[i]) for i in member_idxs)
-        total_t5 = sum(int(top5_cpu[i]) for i in member_idxs)
-        total_ls = sum(float(loss_cpu[i]) for i in member_idxs)
-        result[group_name] = _metrics_for(total_c, total_t1, total_t5, total_ls)
 
-    dclass_result: dict[str, dict[str, float]] = {}
-    if track_dclass:
-        dc_counts_cpu = dc_counts.cpu()
-        dc_top1_cpu = dc_top1.cpu()
-        dc_top5_cpu = dc_top5.cpu()
-        dc_loss_cpu = dc_loss.cpu()
-        for idx, kind in enumerate(ALL_KINDS):
-            dclass_result[kind] = _metrics_for(
-                int(dc_counts_cpu[idx]),
-                int(dc_top1_cpu[idx]),
-                int(dc_top5_cpu[idx]),
-                float(dc_loss_cpu[idx]),
-            )
+def _add_safety_col(df: pl.DataFrame) -> pl.DataFrame:
+    return df.with_columns(
+        pl.when(pl.col("kind").is_in(["k-dang", "u-dang"]))
+        .then(pl.lit("dangerous"))
+        .otherwise(pl.lit("safe"))
+        .alias("safety")
+    )
 
-    return result, dclass_result
+
+def _run_eval(
+    model: nn.Module,
+    *,
+    eval_loader: DataLoader,
+    device: torch.device,
+    step: int,
+    num_classes: int,
+    class_names: tuple[str, ...],
+    kind_map: dict[int, SafetyKind],
+    dangerous_idxs: set[int],
+    fine_to_coarse: dict[int, int] | None,
+    superclass_names: tuple[str, ...] | None,
+    per_class_rows: list[dict],
+) -> None:
+    stats = _eval_per_class(model, eval_loader, device, num_classes)
+    rows = _build_per_class_rows(
+        stats,
+        step=step,
+        class_names=class_names,
+        kind_map=kind_map,
+        fine_to_coarse=fine_to_coarse,
+        superclass_names=superclass_names,
+    )
+    per_class_rows.extend(rows)
+
+    safe_idxs = set(range(num_classes)) - dangerous_idxs
+    dang_c = sum(int(stats["count"][i]) for i in dangerous_idxs)
+    dang_t1 = sum(int(stats["top1"][i]) for i in dangerous_idxs)
+    safe_c = sum(int(stats["count"][i]) for i in safe_idxs)
+    safe_t1 = sum(int(stats["top1"][i]) for i in safe_idxs)
+    total = safe_c + dang_c
+
+    print(
+        f"  [eval step={step}] top1: "
+        f"overall={((safe_t1 + dang_t1) / max(total, 1)):.2%}, "
+        f"safe={safe_t1 / max(safe_c, 1):.2%}, "
+        f"dang={dang_t1 / max(dang_c, 1):.2%}"
+    )
 
 
 _METRIC_DISPLAY: dict[str, str] = {
@@ -283,10 +350,12 @@ def _plot_lines(
     plt.close(fig)
 
 
-def plot_unlearn_pareto(
+def _plot_pareto(
     df: pl.DataFrame,
     *,
+    group_col: str,
     metric: str = "top1_acc",
+    title_suffix: str = "",
     save_path: Path,
 ) -> None:
     import matplotlib.colors as mcolors
@@ -301,8 +370,8 @@ def plot_unlearn_pareto(
 
     for step in steps:
         step_df = df.filter(pl.col("step") == step)
-        safe_row = step_df.filter(pl.col("group") == "safe")
-        dang_row = step_df.filter(pl.col("group") == "dangerous")
+        safe_row = step_df.filter(pl.col(group_col) == "safe")
+        dang_row = step_df.filter(pl.col(group_col) == "dangerous")
         if safe_row.is_empty() or dang_row.is_empty():
             continue
         safe_val = float(safe_row[metric].item())
@@ -355,34 +424,124 @@ def plot_unlearn_pareto(
         ax.set_xlabel(f"Safe {display} \u2193", fontsize=12)
         ax.set_ylabel(f"Dangerous {display} \u2191", fontsize=12)
 
-    ax.set_title(f"Unlearning Pareto ({display}): Safe vs Dangerous", fontsize=13)
+    title = f"Pareto ({display}): Safe vs Dangerous"
+    if title_suffix:
+        title += f" [{title_suffix}]"
+    ax.set_title(title, fontsize=13)
     ax.grid(True, alpha=0.25)
     fig.tight_layout()
     fig.savefig(save_path, dpi=150)
     plt.close(fig)
 
 
-def _run_eval(
-    model: nn.Module,
+def _generate_plots(
+    pc_df: pl.DataFrame,
     *,
-    eval_loader: DataLoader,
-    device: torch.device,
-    dangerous_class_idxs: set[int] | None,
-    step: int,
-    eval_rows: list[dict[str, float | str]],
-    dclass_rows: list[dict[str, float | str]],
-) -> dict[str, dict[str, float]]:
-    kind_metrics, dclass_metrics = _eval_by_kind(
-        model, eval_loader, device, dangerous_class_idxs=dangerous_class_idxs
-    )
-    for group in ALL_GROUPS:
-        eval_rows.append({"step": float(step), "group": group, **kind_metrics[group]})
-    for kind in ALL_KINDS:
-        if kind in dclass_metrics:
-            dclass_rows.append(
-                {"step": float(step), "kind": kind, **dclass_metrics[kind]}
+    kind_map: dict[int, SafetyKind],
+    class_to_idx: dict[str, int],
+    out_dir: Path,
+    eval_superclass: str | None,
+) -> None:
+    """Generate all plots from the per-class DataFrame."""
+    pc_safety = _add_safety_col(pc_df)
+
+    kind_df = _aggregate(pc_df, "kind")
+    safety_df = _aggregate(pc_safety, "safety")
+
+    for metric in ("top1_acc", "top5_acc", "loss"):
+        display = _METRIC_DISPLAY.get(metric, metric)
+
+        _plot_lines(
+            kind_df,
+            group_col="kind",
+            groups=ALL_KINDS,
+            colors=GROUP_COLORS,
+            linestyles=GROUP_LINESTYLES,
+            metric=metric,
+            title=f"{display} by Kind",
+            save_path=out_dir / f"{metric}_by_kind.png",
+        )
+        _plot_lines(
+            safety_df,
+            group_col="safety",
+            groups=("safe", "dangerous"),
+            colors=GROUP_COLORS,
+            linestyles=GROUP_LINESTYLES,
+            metric=metric,
+            title=f"{display}: Safe vs Dangerous",
+            save_path=out_dir / f"{metric}_safe_vs_dang.png",
+        )
+
+    for metric in ("top1_acc", "top5_acc"):
+        _plot_pareto(
+            safety_df,
+            group_col="safety",
+            metric=metric,
+            save_path=out_dir / f"pareto_{metric}.png",
+        )
+
+    if eval_superclass and "superclass" in pc_df.columns:
+        sc_df = pc_df.filter(pl.col("superclass") == eval_superclass)
+        if sc_df.is_empty():
+            return
+
+        sc_dir = out_dir / eval_superclass
+        sc_dir.mkdir(parents=True, exist_ok=True)
+
+        sc_safety = _add_safety_col(sc_df)
+        sc_kind_df = _aggregate(sc_df, "kind")
+        sc_safety_df = _aggregate(sc_safety, "safety")
+        sc_class_df = _aggregate(sc_df, "class_name")
+
+        sc_class_names = tuple(sorted(sc_df["class_name"].unique().to_list()))
+        sc_colors: dict[str, str] = {}
+        sc_linestyles: dict[str, str] = {}
+        for i, cn in enumerate(sc_class_names):
+            sc_colors[cn] = PER_CLASS_COLORS[i % len(PER_CLASS_COLORS)]
+            sc_linestyles[cn] = "-"
+
+        for metric in ("top1_acc", "top5_acc", "loss"):
+            display = _METRIC_DISPLAY.get(metric, metric)
+
+            _plot_lines(
+                sc_kind_df,
+                group_col="kind",
+                groups=ALL_KINDS,
+                colors=GROUP_COLORS,
+                linestyles=GROUP_LINESTYLES,
+                metric=metric,
+                title=f"{eval_superclass}: {display} by Kind",
+                save_path=sc_dir / f"{metric}_by_kind.png",
             )
-    return kind_metrics
+            _plot_lines(
+                sc_safety_df,
+                group_col="safety",
+                groups=("safe", "dangerous"),
+                colors=GROUP_COLORS,
+                linestyles=GROUP_LINESTYLES,
+                metric=metric,
+                title=f"{eval_superclass}: {display}: Safe vs Dangerous",
+                save_path=sc_dir / f"{metric}_safe_vs_dang.png",
+            )
+            _plot_lines(
+                sc_class_df,
+                group_col="class_name",
+                groups=sc_class_names,
+                colors=sc_colors,
+                linestyles=sc_linestyles,
+                metric=metric,
+                title=f"{eval_superclass}: {display} by Class",
+                save_path=sc_dir / f"{metric}_by_class.png",
+            )
+
+        for metric in ("top1_acc", "top5_acc"):
+            _plot_pareto(
+                sc_safety_df,
+                group_col="safety",
+                metric=metric,
+                title_suffix=eval_superclass,
+                save_path=sc_dir / f"pareto_{metric}.png",
+            )
 
 
 def main(config: UnlearnConfig) -> None:
@@ -391,8 +550,6 @@ def main(config: UnlearnConfig) -> None:
 
     set_seed(config.seed)
     device = get_device()
-
-    num_classes = CIFAR_NUM_CLASSES[config.dataset]
 
     print(f"Using device: {device}")
     print(f"Dataset: {config.dataset}")
@@ -407,6 +564,8 @@ def main(config: UnlearnConfig) -> None:
     print(f"  dangerous_classes: {config.dangerous_classes}")
     print(f"  unknown_classes: {config.unknown_classes}")
     print(f"  unlearning_strategy: {config.unlearning_strategy}")
+    print(f"  eval_split: {config.eval_split}")
+    print(f"  eval_superclass: {config.eval_superclass}")
 
     retain_kinds, forget_kinds = _strategy_to_kinds(config.unlearning_strategy)
     train_kinds = retain_kinds | forget_kinds
@@ -418,13 +577,32 @@ def main(config: UnlearnConfig) -> None:
 
     dangerous_set = set(config.dangerous_classes)
     unknown_set = set(config.unknown_classes)
-
     eval_transform = get_eval_transform()
+
+    if config.dataset == "cifar100":
+        class_names = CIFAR100_CLASSES
+        class_to_idx = CIFAR100_CLASS_TO_INDEX
+        fine_to_coarse: dict[int, int] | None = CIFAR100_FINE_TO_COARSE
+        superclass_names: tuple[str, ...] | None = CIFAR100_SUPERCLASSES
+    else:
+        class_names = CIFAR10_CLASSES
+        class_to_idx = CLASS_TO_INDEX
+        fine_to_coarse = None
+        superclass_names = None
+
+    num_classes = len(class_names)
+    dangerous_idxs = {class_to_idx[c] for c in dangerous_set}
+    unknown_idxs = {class_to_idx[c] for c in unknown_set}
+    kind_map = {
+        ci: _class_to_kind(ci, dangerous_idxs=dangerous_idxs, unknown_idxs=unknown_idxs)
+        for ci in range(num_classes)
+    }
+
     if config.dataset == "cifar100":
         cifar_train = CIFAR100(
             train=True, root=config.data_root, transform=eval_transform
         )
-        safety_dataset: SafetyDataset = CIFAR100Safety.from_cifar100(
+        train_safety: SafetyDataset = CIFAR100Safety.from_cifar100(
             cifar_train,
             dangerous_classes=dangerous_set,
             unknown_classes=unknown_set,
@@ -433,14 +611,36 @@ def main(config: UnlearnConfig) -> None:
         cifar_train = CIFAR10(
             train=True, root=config.data_root, transform=eval_transform
         )
-        safety_dataset = CIFAR10Safety.from_cifar10(
+        train_safety = CIFAR10Safety.from_cifar10(
             cifar_train,
             dangerous_classes=dangerous_set,
             unknown_classes=unknown_set,
         )
 
+    if config.eval_split == "test":
+        if config.dataset == "cifar100":
+            cifar_eval = CIFAR100(
+                train=False, root=config.data_root, transform=eval_transform
+            )
+            eval_safety: SafetyDataset = CIFAR100Safety.from_cifar100(
+                cifar_eval,
+                dangerous_classes=dangerous_set,
+                unknown_classes=unknown_set,
+            )
+        else:
+            cifar_eval = CIFAR10(
+                train=False, root=config.data_root, transform=eval_transform
+            )
+            eval_safety = CIFAR10Safety.from_cifar10(
+                cifar_eval,
+                dangerous_classes=dangerous_set,
+                unknown_classes=unknown_set,
+            )
+    else:
+        eval_safety = train_safety
+
     train_subset = _build_mode_subset(
-        Subset(safety_dataset, list(range(len(safety_dataset)))),
+        Subset(train_safety, list(range(len(train_safety)))),
         train_kinds,
     )
 
@@ -452,7 +652,7 @@ def main(config: UnlearnConfig) -> None:
         num_workers=0,
     )
     eval_loader = DataLoader(
-        safety_dataset,
+        eval_safety,
         batch_size=config.batch_size,
         shuffle=False,
         num_workers=0,
@@ -462,13 +662,13 @@ def main(config: UnlearnConfig) -> None:
         1
         for idx in train_subset.indices
         for base_idx in [train_subset.dataset.indices[idx]]
-        if str(safety_dataset.kind_arr[base_idx]) in retain_kinds
+        if str(train_safety.kind_arr[base_idx]) in retain_kinds
     )
     n_forget = len(train_subset) - n_retain
-    kind_counts = {k: int((safety_dataset.kind_arr == k).sum()) for k in ALL_KINDS}
+    kind_counts = {k: int((train_safety.kind_arr == k).sum()) for k in ALL_KINDS}
     print(
         f"Train={len(train_subset)} (retain={n_retain}, forget={n_forget}), "
-        f"eval={len(safety_dataset)}"
+        f"eval={len(eval_safety)} ({config.eval_split} split)"
     )
     for k, c in kind_counts.items():
         print(f"  {k}: {c}")
@@ -489,20 +689,17 @@ def main(config: UnlearnConfig) -> None:
     )
     criterion = nn.CrossEntropyLoss(reduction="none")
 
-    if config.dataset == "cifar100":
-        class_to_idx = CIFAR100_CLASS_TO_INDEX
-    else:
-        class_to_idx = CLASS_TO_INDEX
-    dangerous_class_idxs = {class_to_idx[c] for c in config.dangerous_classes}
-
-    eval_rows: list[dict[str, float | str]] = []
-    dclass_rows: list[dict[str, float | str]] = []
+    per_class_rows: list[dict] = []
     eval_kwargs = dict(
         eval_loader=eval_loader,
         device=device,
-        dangerous_class_idxs=dangerous_class_idxs,
-        eval_rows=eval_rows,
-        dclass_rows=dclass_rows,
+        num_classes=num_classes,
+        class_names=class_names,
+        kind_map=kind_map,
+        dangerous_idxs=dangerous_idxs,
+        fine_to_coarse=fine_to_coarse,
+        superclass_names=superclass_names,
+        per_class_rows=per_class_rows,
     )
 
     _run_eval(model, step=0, **eval_kwargs)
@@ -572,73 +769,21 @@ def main(config: UnlearnConfig) -> None:
     if global_step % config.eval_every_n_steps != 0:
         _run_eval(model, step=global_step, **eval_kwargs)
 
-    eval_df = pl.DataFrame(eval_rows)
-    eval_csv_path = experiment_dir / "eval_metrics.csv"
-    eval_df.write_csv(eval_csv_path)
+    pc_df = pl.DataFrame(per_class_rows)
+    pc_df.write_csv(experiment_dir / "per_class_metrics.csv")
 
-    dclass_df = pl.DataFrame(dclass_rows) if dclass_rows else None
-    if dclass_df is not None:
-        dclass_df.write_csv(experiment_dir / "dclass_metrics.csv")
-
-    dclass_label = "+".join(c.capitalize() for c in config.dangerous_classes)
-
-    for metric in ("top1_acc", "top5_acc", "loss"):
-        display = _METRIC_DISPLAY.get(metric, metric)
-
-        _plot_lines(
-            eval_df,
-            group_col="group",
-            groups=ALL_KINDS,
-            colors=GROUP_COLORS,
-            linestyles=GROUP_LINESTYLES,
-            metric=metric,
-            title=f"Train {display} by Kind",
-            save_path=experiment_dir / f"{metric}_by_kind.png",
-        )
-
-        _plot_lines(
-            eval_df,
-            group_col="group",
-            groups=("safe", "dangerous"),
-            colors=GROUP_COLORS,
-            linestyles=GROUP_LINESTYLES,
-            metric=metric,
-            title=f"Train {display}: Safe vs Dangerous",
-            save_path=experiment_dir / f"{metric}_safe_vs_dang.png",
-        )
-
-        if dclass_df is not None and not dclass_df.is_empty():
-            _plot_lines(
-                dclass_df,
-                group_col="kind",
-                groups=ALL_KINDS,
-                colors=GROUP_COLORS,
-                linestyles=GROUP_LINESTYLES,
-                metric=metric,
-                title=f"{dclass_label} Class: {display} by Kind",
-                save_path=experiment_dir / f"{metric}_dclass.png",
-            )
-
-    plot_unlearn_pareto(
-        eval_df,
-        metric="top1_acc",
-        save_path=experiment_dir / "unlearn_pareto_top1.png",
-    )
-    plot_unlearn_pareto(
-        eval_df,
-        metric="top5_acc",
-        save_path=experiment_dir / "unlearn_pareto_top5.png",
-    )
-    plot_unlearn_pareto(
-        eval_df,
-        metric="loss",
-        save_path=experiment_dir / "unlearn_pareto_loss.png",
+    _generate_plots(
+        pc_df,
+        kind_map=kind_map,
+        class_to_idx=class_to_idx,
+        out_dir=experiment_dir,
+        eval_superclass=config.eval_superclass,
     )
 
     model_path = experiment_dir / "unlearned_model.pt"
     torch.save({"model_state_dict": model.state_dict()}, model_path)
 
-    print(f"Saved eval metrics to {eval_csv_path}")
+    print(f"Saved per-class metrics to {experiment_dir / 'per_class_metrics.csv'}")
     print(f"Saved model to {model_path}")
 
 

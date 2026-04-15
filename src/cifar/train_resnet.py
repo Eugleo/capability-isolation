@@ -1,7 +1,7 @@
 import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import cast
+from typing import Literal, cast
 
 import numpy as np
 import torch
@@ -10,19 +10,34 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from torchvision import models, transforms
 
-from src.cifar.data import CIFAR10, CIFAR10_CLASSES, KnownPolicy
+from src.cifar.data import (
+    CIFAR10,
+    CIFAR10_CLASSES,
+    CIFAR100,
+    CIFAR100_CLASSES,
+    KnownPolicy,
+)
 from src.utils import get_device, set_seed
+
+CifarVariant = Literal["cifar10", "cifar100"]
+
+CIFAR_NUM_CLASSES: dict[CifarVariant, int] = {"cifar10": 10, "cifar100": 100}
+CIFAR_CLASS_NAMES: dict[CifarVariant, tuple[str, ...]] = {
+    "cifar10": CIFAR10_CLASSES,
+    "cifar100": CIFAR100_CLASSES,
+}
 
 
 @dataclass
 class TrainResNetConfig:
+    dataset: CifarVariant = "cifar100"
     seed: int = 42
-    epochs: int = 100
+    epochs: int = 300
     lr: float = 1e-4
     weight_decay: float = 1e-4
     batch_size: int = 128
     data_root: str = "data"
-    model_dir: str = "checkpoints/cifar"
+    model_dir: str = "checkpoints/cifar100"
 
 
 def get_train_transform() -> transforms.Compose:
@@ -51,7 +66,7 @@ def get_eval_transform() -> transforms.Compose:
     )
 
 
-def build_cifar_resnet18() -> nn.Module:
+def build_cifar_resnet18(num_classes: int = 100) -> nn.Module:
     model = models.resnet18(weights=None)
     model.conv1 = nn.Conv2d(
         3,
@@ -62,7 +77,7 @@ def build_cifar_resnet18() -> nn.Module:
         bias=False,
     )
     model.maxpool = nn.Identity()
-    model.fc = nn.Linear(model.fc.in_features, 10)
+    model.fc = nn.Linear(model.fc.in_features, num_classes)
     return model
 
 
@@ -100,7 +115,7 @@ def evaluate_overall_and_per_class(
     model: nn.Module,
     loader: DataLoader,
     device: torch.device,
-    class_names: tuple[str, ...] = CIFAR10_CLASSES,
+    class_names: tuple[str, ...] = CIFAR100_CLASSES,
 ) -> dict[str, float]:
     model.eval()
     criterion = nn.CrossEntropyLoss(reduction="none")
@@ -148,11 +163,15 @@ def evaluate_overall_and_per_class(
     return metrics
 
 
-def print_class_metrics(name: str, metrics: dict[str, float]) -> None:
+def print_class_metrics(
+    name: str,
+    metrics: dict[str, float],
+    class_names: tuple[str, ...] = CIFAR100_CLASSES,
+) -> None:
     print(f"\n{name}")
     print(f"  overall/loss: {metrics['loss']:.4f}")
     print(f"  overall/accuracy: {metrics['accuracy']:.2%}")
-    for class_name in CIFAR10_CLASSES:
+    for class_name in class_names:
         count = int(metrics[f"class/{class_name}/count"])
         loss = metrics[f"class/{class_name}/loss"]
         acc = metrics[f"class/{class_name}/accuracy"]
@@ -172,14 +191,19 @@ def main() -> None:
     set_seed(config.seed)
     device = get_device()
     print(f"Using device: {device}")
+    print(f"Dataset: {config.dataset}")
 
-    train_dataset = CIFAR10(
+    num_classes = CIFAR_NUM_CLASSES[config.dataset]
+    class_names = CIFAR_CLASS_NAMES[config.dataset]
+    DatasetCls = CIFAR100 if config.dataset == "cifar100" else CIFAR10
+
+    train_dataset = DatasetCls(
         train=True, root=config.data_root, transform=get_train_transform()
     )
-    train_eval_dataset = CIFAR10(
+    train_eval_dataset = DatasetCls(
         train=True, root=config.data_root, transform=get_eval_transform()
     )
-    test_dataset = CIFAR10(
+    test_dataset = DatasetCls(
         train=False, root=config.data_root, transform=get_eval_transform()
     )
 
@@ -202,7 +226,7 @@ def main() -> None:
         num_workers=0,
     )
 
-    model = build_cifar_resnet18().to(device)
+    model = build_cifar_resnet18(num_classes=num_classes).to(device)
     optimizer = optim.Adam(
         model.parameters(),
         lr=config.lr,
@@ -230,10 +254,14 @@ def main() -> None:
         )
         scheduler.step()
 
-    train_metrics = evaluate_overall_and_per_class(model, train_eval_loader, device)
-    test_metrics = evaluate_overall_and_per_class(model, test_loader, device)
-    print_class_metrics("Final train metrics", train_metrics)
-    print_class_metrics("Final test metrics", test_metrics)
+    train_metrics = evaluate_overall_and_per_class(
+        model, train_eval_loader, device, class_names=class_names
+    )
+    test_metrics = evaluate_overall_and_per_class(
+        model, test_loader, device, class_names=class_names
+    )
+    print_class_metrics("Final train metrics", train_metrics, class_names=class_names)
+    print_class_metrics("Final test metrics", test_metrics, class_names=class_names)
 
     model_dir = Path(config.model_dir)
     model_dir.mkdir(parents=True, exist_ok=True)

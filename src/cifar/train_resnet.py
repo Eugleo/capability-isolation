@@ -3,6 +3,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Literal, cast
 
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
@@ -32,7 +33,7 @@ CIFAR_CLASS_NAMES: dict[CifarVariant, tuple[str, ...]] = {
 class TrainResNetConfig:
     dataset: CifarVariant = "cifar100"
     seed: int = 42
-    epochs: int = 300
+    epochs: int = 5
     lr: float = 1e-4
     weight_decay: float = 1e-4
     batch_size: int = 128
@@ -163,6 +164,65 @@ def evaluate_overall_and_per_class(
     return metrics
 
 
+@torch.no_grad()
+def evaluate_topk(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    ks: tuple[int, ...] = (1, 5),
+) -> dict[int, float]:
+    model.eval()
+    total_count = 0
+    correct_at_k = {k: 0 for k in ks}
+    max_k = max(ks)
+
+    for batch in loader:
+        images = batch["image"].to(device)
+        labels = batch["label"].to(device)
+        topk_preds = model(images).topk(max_k, dim=1).indices
+        for k in ks:
+            correct_at_k[k] += (
+                topk_preds[:, :k].eq(labels.unsqueeze(1)).any(dim=1).sum().item()
+            )
+        total_count += labels.size(0)
+
+    return {k: correct_at_k[k] / max(total_count, 1) for k in ks}
+
+
+def plot_per_class_accuracy(
+    metrics: dict[str, float],
+    class_names: tuple[str, ...],
+    save_path: Path,
+) -> None:
+    accs = []
+    for name in class_names:
+        acc = metrics.get(f"class/{name}/accuracy", float("nan"))
+        accs.append((name, acc))
+    accs.sort(key=lambda x: x[1] if not np.isnan(x[1]) else -1, reverse=True)
+
+    names = [a[0] for a in accs]
+    values = [a[1] * 100 for a in accs]
+
+    fig, ax = plt.subplots(figsize=(max(len(names) * 0.35, 10), 6))
+    bars = ax.bar(range(len(names)), values, width=0.8)
+    for bar, v in zip(bars, values):
+        color_val = v / 100.0
+        bar.set_color(plt.cm.RdYlGn(color_val))
+
+    ax.set_xticks(range(len(names)))
+    ax.set_xticklabels(names, rotation=90, fontsize=7)
+    ax.set_ylabel("Accuracy (%)")
+    ax.set_title("Per-class test accuracy (sorted)")
+    ax.set_ylim(0, 105)
+    ax.set_yticks([0, 20, 40, 60, 80, 100])
+    ax.yaxis.grid(True, linestyle="--", alpha=0.5)
+    ax.set_axisbelow(True)
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=150)
+    plt.close(fig)
+    print(f"Saved per-class accuracy plot to {save_path}")
+
+
 def print_class_metrics(
     name: str,
     metrics: dict[str, float],
@@ -239,6 +299,7 @@ def main() -> None:
     )
     criterion = nn.CrossEntropyLoss()
 
+    eval_every = 5
     for epoch in range(config.epochs):
         train_loss, train_acc = train_one_epoch(
             model=model,
@@ -254,6 +315,10 @@ def main() -> None:
         )
         scheduler.step()
 
+        if (epoch + 1) % eval_every == 0:
+            topk = evaluate_topk(model, test_loader, device, ks=(1, 5))
+            print(f"  [eval] top-1={topk[1]:.2%}, top-5={topk[5]:.2%}")
+
     train_metrics = evaluate_overall_and_per_class(
         model, train_eval_loader, device, class_names=class_names
     )
@@ -263,6 +328,9 @@ def main() -> None:
     print_class_metrics("Final train metrics", train_metrics, class_names=class_names)
     print_class_metrics("Final test metrics", test_metrics, class_names=class_names)
 
+    topk_final = evaluate_topk(model, test_loader, device, ks=(1, 5))
+    print(f"\nFinal test top-1={topk_final[1]:.2%}, top-5={topk_final[5]:.2%}")
+
     model_dir = Path(config.model_dir)
     model_dir.mkdir(parents=True, exist_ok=True)
     model_path = model_dir / "train_resnet.pt"
@@ -271,6 +339,10 @@ def main() -> None:
         json.dump(asdict(config), f, indent=2)
     print(f"\nSaved model to {model_path}")
     print(f"Saved config to {model_dir / 'train_resnet_config.json'}")
+
+    plot_per_class_accuracy(
+        test_metrics, class_names, model_dir / "per_class_accuracy.png"
+    )
 
 
 if __name__ == "__main__":

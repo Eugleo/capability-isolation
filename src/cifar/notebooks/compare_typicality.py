@@ -64,3 +64,38 @@ fig.tight_layout()
 plt.show()
 
 # %%
+class_name = "seal"
+n_show = 8
+
+class_idx = CIFAR100_CLASSES.index(class_name)
+class_mask = labels == class_idx
+class_indices = np.where(class_mask)[0]
+class_typicality = typicality[class_mask]
+
+rank_order = np.argsort(class_typicality)
+most_typical_idx = class_indices[rank_order[-n_show:][::-1]]
+least_typical_idx = class_indices[rank_order[:n_show]]
+
+fig, axes = plt.subplots(2, n_show, figsize=(2.4 * n_show, 5.5))
+
+for col, global_idx in enumerate(most_typical_idx):
+    img = cifar100_train[int(global_idx)]["image"].permute(1, 2, 0).numpy()
+    ax = axes[0, col]
+    ax.imshow(img)
+    ax.set_title(f"{typicality[global_idx]:.4f}", fontsize=9)
+    ax.axis("off")
+
+for col, global_idx in enumerate(least_typical_idx):
+    img = cifar100_train[int(global_idx)]["image"].permute(1, 2, 0).numpy()
+    ax = axes[1, col]
+    ax.imshow(img)
+    ax.set_title(f"{typicality[global_idx]:.4f}", fontsize=9)
+    ax.axis("off")
+
+axes[0, 0].set_ylabel("Most typical", fontsize=11)
+axes[1, 0].set_ylabel("Least typical", fontsize=11)
+fig.suptitle(f"'{class_name}': most vs least typical images", fontsize=14)
+fig.tight_layout()
+plt.show()
+
+# %%

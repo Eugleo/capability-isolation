@@ -22,6 +22,12 @@ from src.cifar.train_resnet import (
 from src.utils import get_device, set_seed
 
 ALL_KINDS: tuple[SafetyKind, ...] = ("k-safe", "k-dang", "u-safe", "u-dang")
+KIND_COLORS: dict[SafetyKind, str] = {
+    "k-dang": "red",
+    "u-dang": "orange",
+    "u-safe": "lightgreen",
+    "k-safe": "darkgreen",
+}
 SplitMode = Literal["safe", "safe+unk", "dang", "dang+unk"]
 
 
@@ -40,7 +46,7 @@ class UnlearnConfig:
     safety_eval_n_per_kind: int = 50
 
     data_root: str = "data"
-    dangerous_class: str = "airplane"
+    dangerous_class: str = "cat"
     safe_known: str = "atypical"
     dangerous_known: str = "atypical"
     known_percent: float = 10
@@ -200,6 +206,7 @@ def plot_safety_metric_by_kind(
             kind_df["step"].to_list(),
             kind_df[metric].to_list(),
             label=kind,
+            color=KIND_COLORS[kind],
             marker="o",
             markersize=2,
             linewidth=1.0,
@@ -295,6 +302,9 @@ def _run_eval(
 
 
 def main(config: UnlearnConfig) -> None:
+    if config.name is None:
+        config.name = uuid.uuid4().hex[:8]
+
     set_seed(config.seed)
     device = get_device()
 

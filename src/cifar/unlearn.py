@@ -217,21 +217,30 @@ def plot_unlearn_pareto(
     df: pl.DataFrame,
     *,
     dangerous_class: str,
+    metric: str = "top1_acc",
     save_path: Path,
 ) -> None:
     import matplotlib.colors as mcolors
     from matplotlib.colors import LinearSegmentedColormap
 
+    display = _METRIC_DISPLAY.get(metric, metric)
+    is_acc = metric.endswith("_acc")
+
     steps = sorted(df["step"].unique().to_list())
-    other_acc_pct: list[float] = []
-    forget_quality_pct: list[float] = []
+    retain_vals: list[float] = []
+    forget_vals: list[float] = []
 
     for step in steps:
         step_df = df.filter(pl.col("step") == step)
-        dang = step_df.filter(pl.col("class") == dangerous_class)["top1_acc"].item()
-        others = step_df.filter(pl.col("class") != dangerous_class)["top1_acc"].mean()
-        other_acc_pct.append(float(others) * 100)
-        forget_quality_pct.append((1.0 - float(dang)) * 100)
+        dang = float(step_df.filter(pl.col("class") == dangerous_class)[metric].item())
+        others = float(step_df.filter(pl.col("class") != dangerous_class)[metric].mean())
+
+        if is_acc:
+            retain_vals.append(others * 100)
+            forget_vals.append((1.0 - dang) * 100)
+        else:
+            retain_vals.append(others)
+            forget_vals.append(dang)
 
     norm = mcolors.Normalize(vmin=min(steps), vmax=max(steps))
     cmap = LinearSegmentedColormap.from_list("blues", ["#b3d4fc", "#08306b"])
@@ -240,16 +249,16 @@ def plot_unlearn_pareto(
 
     for i in range(len(steps) - 1):
         ax.plot(
-            other_acc_pct[i : i + 2],
-            forget_quality_pct[i : i + 2],
+            retain_vals[i : i + 2],
+            forget_vals[i : i + 2],
             color=cmap(norm(steps[i])),
             linewidth=1.5,
             zorder=1,
         )
 
     sc = ax.scatter(
-        other_acc_pct,
-        forget_quality_pct,
+        retain_vals,
+        forget_vals,
         c=steps,
         cmap=cmap,
         norm=norm,
@@ -261,13 +270,17 @@ def plot_unlearn_pareto(
     cbar = fig.colorbar(sc, ax=ax, pad=0.02)
     cbar.set_label("Step", fontsize=11)
 
-    ax.set_xlabel("Other Classes Accuracy (%) \u2191", fontsize=12)
-    ax.set_ylabel(
-        f"1 \u2212 {dangerous_class.capitalize()} Accuracy (%) \u2191", fontsize=12
-    )
-    ax.set_xlim(0, 100)
-    ax.set_ylim(0, 100)
-    ax.set_title("Unlearning Pareto: Retain Utility vs Forget Quality", fontsize=13)
+    dang_cap = dangerous_class.capitalize()
+    if is_acc:
+        ax.set_xlabel(f"Other Classes {display} (%) \u2191", fontsize=12)
+        ax.set_ylabel(f"1 \u2212 {dang_cap} {display} (%) \u2191", fontsize=12)
+        ax.set_xlim(0, 100)
+        ax.set_ylim(0, 100)
+    else:
+        ax.set_xlabel(f"Other Classes {display} \u2193", fontsize=12)
+        ax.set_ylabel(f"{dang_cap} {display} \u2191", fontsize=12)
+
+    ax.set_title(f"Unlearning Pareto ({display}): Retain vs Forget", fontsize=13)
     ax.grid(True, alpha=0.25)
     fig.tight_layout()
     fig.savefig(save_path, dpi=150)
@@ -519,7 +532,20 @@ def main(config: UnlearnConfig) -> None:
     plot_unlearn_pareto(
         cifar_class_df,
         dangerous_class=config.dangerous_class,
-        save_path=experiment_dir / "unlearn_pareto.png",
+        metric="top1_acc",
+        save_path=experiment_dir / "unlearn_pareto_top1.png",
+    )
+    plot_unlearn_pareto(
+        cifar_class_df,
+        dangerous_class=config.dangerous_class,
+        metric="top5_acc",
+        save_path=experiment_dir / "unlearn_pareto_top5.png",
+    )
+    plot_unlearn_pareto(
+        cifar_class_df,
+        dangerous_class=config.dangerous_class,
+        metric="loss",
+        save_path=experiment_dir / "unlearn_pareto_loss.png",
     )
 
     model_path = experiment_dir / "unlearned_model.pt"

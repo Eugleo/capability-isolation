@@ -53,12 +53,12 @@ class UnlearnConfig:
     neggrad_forget_weight: float = 5e-5
     max_grad_norm: float = 1.0
     batch_size: int = 128
-    eval_every_n_steps: int = 250
+    eval_every_n_steps: int = 100
     log_every_n_steps: int = 500
     safety_eval_n_per_kind: int = 50
 
     data_root: str = "data"
-    dangerous_class: str = "girl"
+    dangerous_class: str = "seal"
     safe_known: str = "atypical"
     dangerous_known: str = "atypical"
     known_percent: float = 10
@@ -233,7 +233,9 @@ def plot_unlearn_pareto(
     for step in steps:
         step_df = df.filter(pl.col("step") == step)
         dang = float(step_df.filter(pl.col("class") == dangerous_class)[metric].item())
-        others = float(step_df.filter(pl.col("class") != dangerous_class)[metric].mean())
+        others = float(
+            step_df.filter(pl.col("class") != dangerous_class)[metric].mean()
+        )
 
         if is_acc:
             retain_vals.append(others * 100)
@@ -299,7 +301,9 @@ def _run_eval(
     class_names: tuple[str, ...],
 ) -> dict[str, dict[str, float]]:
     for kind, loader in safety_eval_loaders.items():
-        kind_per_class = evaluate_per_class(model, loader, device, class_names=class_names)
+        kind_per_class = evaluate_per_class(
+            model, loader, device, class_names=class_names
+        )
         agg = _aggregate_metrics(kind_per_class)
         safety_rows.append({"step": float(step), "kind": kind, **agg})
 
@@ -560,9 +564,9 @@ if __name__ == "__main__":
     base_config = UnlearnConfig()
 
     strategies: list[UnlearningStrategy] = [
-        # "ignore-unknown",
+        "ignore-unknown",
+        "forget-unknown",
         "retain-unknown",
-        # "forget-unknown",
     ]
     labeled_percents = [1, 5, 10, 25, 50, 90, 99]
 

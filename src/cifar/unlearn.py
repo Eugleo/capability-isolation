@@ -12,14 +12,25 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, Subset
 
-from src.cifar.data import CIFAR10, CIFAR10_CLASSES, CIFAR10Safety, SafetyKind
+from src.cifar.data import (
+    CIFAR10,
+    CIFAR100,
+    CIFAR10Safety,
+    CIFAR100Safety,
+    SafetyKind,
+)
 from src.cifar.train_resnet import (
+    CIFAR_CLASS_NAMES,
+    CIFAR_NUM_CLASSES,
+    CifarVariant,
     build_cifar_resnet18,
     evaluate_overall_and_per_class,
     get_eval_transform,
     validate_known_policy,
 )
 from src.utils import get_device, set_seed
+
+SafetyDataset = CIFAR10Safety | CIFAR100Safety
 
 ALL_KINDS: tuple[SafetyKind, ...] = ("k-safe", "k-dang", "u-safe", "u-dang")
 KIND_COLORS: dict[SafetyKind, str] = {
@@ -28,12 +39,13 @@ KIND_COLORS: dict[SafetyKind, str] = {
     "u-safe": "lightgreen",
     "k-safe": "darkgreen",
 }
-SplitMode = Literal["safe", "safe+unk", "dang", "dang+unk"]
+UnlearningStrategy = Literal["ignore-unknown", "retain-unknown", "forget-unknown"]
 
 
 @dataclass
 class UnlearnConfig:
     name: str | None = None
+    dataset: CifarVariant = "cifar100"
     seed: int = 42
     max_steps: int = 5000
     lr: float = 1e-5
@@ -46,14 +58,13 @@ class UnlearnConfig:
     safety_eval_n_per_kind: int = 50
 
     data_root: str = "data"
-    dangerous_class: str = "cat"
+    dangerous_class: str = "girl"
     safe_known: str = "atypical"
     dangerous_known: str = "atypical"
     known_percent: float = 10
-    retain_mode: SplitMode = "safe"
-    forget_mode: SplitMode = "dang"
+    unlearning_strategy: UnlearningStrategy = "ignore-unknown"
 
-    pretrained_model_path: str = "checkpoints/cifar/train_resnet.pt"
+    pretrained_model_path: str = "checkpoints/cifar100/train_resnet.pt"
     experiments_root: str = "experiments"
 
 
@@ -70,21 +81,22 @@ def _create_experiment_dir(root: str, *, name: str | None = None) -> Path:
     return exp_dir
 
 
-def _mode_to_kinds(mode: SplitMode) -> tuple[SafetyKind, ...]:
-    if mode == "safe":
-        return ("k-safe",)
-    if mode == "safe+unk":
-        return ("k-safe", "u-safe", "u-dang")
-    if mode == "dang":
-        return ("k-dang",)
-    if mode == "dang+unk":
-        return ("k-dang", "u-safe", "u-dang")
-    raise ValueError(f"Unknown mode: {mode}")
+def _strategy_to_kinds(
+    strategy: UnlearningStrategy,
+) -> tuple[set[SafetyKind], set[SafetyKind]]:
+    """Returns (retain_kinds, forget_kinds) for the given strategy."""
+    retain: set[SafetyKind] = {"k-safe"}
+    forget: set[SafetyKind] = {"k-dang"}
+    if strategy == "retain-unknown":
+        retain |= {"u-safe", "u-dang"}
+    elif strategy == "forget-unknown":
+        forget |= {"u-safe", "u-dang"}
+    return retain, forget
 
 
 def _build_mode_subset(
-    subset: Subset[CIFAR10Safety], allowed_kinds: set[SafetyKind]
-) -> Subset[CIFAR10Safety]:
+    subset: Subset[SafetyDataset], allowed_kinds: set[SafetyKind]
+) -> Subset[SafetyDataset]:
     selected_positions: list[int] = []
     for pos, base_idx in enumerate(subset.indices):
         kind = subset.dataset.kind_arr[int(base_idx)]
@@ -94,11 +106,11 @@ def _build_mode_subset(
 
 
 def _sample_safety_eval_subset(
-    dataset: CIFAR10Safety,
+    dataset: SafetyDataset,
     *,
     n_per_kind: int,
     seed: int,
-) -> Subset[CIFAR10Safety]:
+) -> Subset[SafetyDataset]:
     import numpy as np
 
     rng = np.random.RandomState(seed)
@@ -178,8 +190,9 @@ def _append_cifar_class_rows(
     metrics: dict[str, float],
     *,
     step: int,
+    class_names: tuple[str, ...],
 ) -> None:
-    for class_name in CIFAR10_CLASSES:
+    for class_name in class_names:
         rows.append(
             {
                 "step": float(step),
@@ -293,11 +306,16 @@ def _run_eval(
     step: int,
     safety_rows: list[dict[str, float | str]],
     cifar_class_rows: list[dict[str, float | str]],
+    class_names: tuple[str, ...],
 ) -> dict[str, float]:
     safety_metrics = evaluate_safety_by_kind(model, safety_eval_loader, device)
     _append_safety_rows(safety_rows, safety_metrics, step=step)
-    cifar_metrics = evaluate_overall_and_per_class(model, cifar_test_loader, device)
-    _append_cifar_class_rows(cifar_class_rows, cifar_metrics, step=step)
+    cifar_metrics = evaluate_overall_and_per_class(
+        model, cifar_test_loader, device, class_names=class_names
+    )
+    _append_cifar_class_rows(
+        cifar_class_rows, cifar_metrics, step=step, class_names=class_names
+    )
     return cifar_metrics
 
 
@@ -308,7 +326,11 @@ def main(config: UnlearnConfig) -> None:
     set_seed(config.seed)
     device = get_device()
 
+    num_classes = CIFAR_NUM_CLASSES[config.dataset]
+    class_names = CIFAR_CLASS_NAMES[config.dataset]
+
     print(f"Using device: {device}")
+    print(f"Dataset: {config.dataset}")
     print("NegGrad unlearning config:")
     print(f"  max_steps: {config.max_steps}")
     print(f"  lr: {config.lr}")
@@ -318,19 +340,10 @@ def main(config: UnlearnConfig) -> None:
     print(f"  batch_size: {config.batch_size}")
     print(f"  eval_every_n_steps: {config.eval_every_n_steps}")
     print(f"  known_percent: {config.known_percent}")
-    print(f"  retain_mode: {config.retain_mode}")
-    print(f"  forget_mode: {config.forget_mode}")
+    print(f"  unlearning_strategy: {config.unlearning_strategy}")
 
-    retain_kinds = set(_mode_to_kinds(config.retain_mode))
-    forget_kinds = set(_mode_to_kinds(config.forget_mode))
+    retain_kinds, forget_kinds = _strategy_to_kinds(config.unlearning_strategy)
     train_kinds = retain_kinds | forget_kinds
-    if ("u-safe" in retain_kinds or "u-dang" in retain_kinds) and (
-        "u-safe" in forget_kinds or "u-dang" in forget_kinds
-    ):
-        raise ValueError(
-            "Unknown examples cannot be in both retain and forget. "
-            "Choose modes so unknown belongs to only one side (or neither)."
-        )
 
     experiment_dir = _create_experiment_dir(config.experiments_root, name=config.name)
     with open(experiment_dir / "config.json", "w") as f:
@@ -338,16 +351,36 @@ def main(config: UnlearnConfig) -> None:
     print(f"Experiment dir: {experiment_dir}")
 
     eval_transform = get_eval_transform()
-    cifar_train = CIFAR10(train=True, root=config.data_root, transform=eval_transform)
-    cifar_test = CIFAR10(train=False, root=config.data_root, transform=eval_transform)
-    safety_dataset = CIFAR10Safety.from_cifar10(
-        cifar_train,
-        dangerous_class=config.dangerous_class,
-        safe_known=validate_known_policy(config.safe_known),
-        dangerous_known=validate_known_policy(config.dangerous_known),
-        known_percent=config.known_percent,
-        seed=config.seed,
-    )
+    if config.dataset == "cifar100":
+        cifar_train = CIFAR100(
+            train=True, root=config.data_root, transform=eval_transform
+        )
+        cifar_test = CIFAR100(
+            train=False, root=config.data_root, transform=eval_transform
+        )
+        safety_dataset: SafetyDataset = CIFAR100Safety.from_cifar100(
+            cifar_train,
+            dangerous_classes={config.dangerous_class},
+            safe_known=validate_known_policy(config.safe_known),
+            dangerous_known=validate_known_policy(config.dangerous_known),
+            known_percent=config.known_percent,
+            seed=config.seed,
+        )
+    else:
+        cifar_train = CIFAR10(
+            train=True, root=config.data_root, transform=eval_transform
+        )
+        cifar_test = CIFAR10(
+            train=False, root=config.data_root, transform=eval_transform
+        )
+        safety_dataset = CIFAR10Safety.from_cifar10(
+            cifar_train,
+            dangerous_class=config.dangerous_class,
+            safe_known=validate_known_policy(config.safe_known),
+            dangerous_known=validate_known_policy(config.dangerous_known),
+            known_percent=config.known_percent,
+            seed=config.seed,
+        )
 
     train_subset = _build_mode_subset(
         Subset(safety_dataset, list(range(len(safety_dataset)))),
@@ -391,7 +424,7 @@ def main(config: UnlearnConfig) -> None:
         f"safety_eval={len(safety_eval_subset)}"
     )
 
-    model = build_cifar_resnet18().to(device)
+    model = build_cifar_resnet18(num_classes=num_classes).to(device)
     checkpoint = torch.load(
         config.pretrained_model_path,
         map_location=device,
@@ -415,6 +448,7 @@ def main(config: UnlearnConfig) -> None:
         device=device,
         safety_rows=safety_rows,
         cifar_class_rows=cifar_class_rows,
+        class_names=class_names,
     )
 
     _run_eval(model, step=0, **eval_kwargs)
@@ -518,24 +552,24 @@ def main(config: UnlearnConfig) -> None:
 if __name__ == "__main__":
     base_config = UnlearnConfig()
 
-    mode_pairs: list[tuple[SplitMode, SplitMode, str]] = [
-        ("safe", "dang"),
-        ("safe+unk", "dang"),
-        ("safe", "dang+unk"),
+    strategies: list[UnlearningStrategy] = [
+        # "ignore-unknown",
+        "retain-unknown",
+        # "forget-unknown",
     ]
-    labeled_percents = [1, 5, 10, 25, 50]
+    labeled_percents = [75, 90, 99]
 
     configs: list[UnlearnConfig] = []
-    for retain_mode, forget_mode in mode_pairs:
+    for strategy in strategies:
         for known_percent in labeled_percents:
+            tag = strategy.replace("-", "_")
             configs.append(
                 UnlearnConfig(
                     **{
                         **asdict(base_config),
-                        "name": f"{retain_mode}_{forget_mode}_{known_percent}p",
+                        "name": f"{tag}_{known_percent}p",
                         "known_percent": float(known_percent),
-                        "retain_mode": retain_mode,
-                        "forget_mode": forget_mode,
+                        "unlearning_strategy": strategy,
                     }
                 )
             )

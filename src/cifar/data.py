@@ -582,6 +582,8 @@ class CIFAR100Safety(Dataset):
         *,
         typicality_scores: np.ndarray,
         dangerous_classes: set[str],
+        dangerous_percent: float = 100.0,
+        dangerous_policy: KnownPolicy = "atypical",
         safe_known: KnownPolicy,
         dangerous_known: KnownPolicy,
         known_percent: float,
@@ -594,26 +596,43 @@ class CIFAR100Safety(Dataset):
                 )
         if not (0.0 <= known_percent <= 100.0):
             raise ValueError(f"known_percent must be in [0, 100], got {known_percent}")
+        if not (0.0 <= dangerous_percent <= 100.0):
+            raise ValueError(
+                f"dangerous_percent must be in [0, 100], got {dangerous_percent}"
+            )
         if len(typicality_scores) != len(cifar100):
             raise ValueError(
                 "typicality_scores length does not match dataset length: "
                 f"{len(typicality_scores)} vs {len(cifar100)}"
             )
 
-        labels = np.asarray(cifar100.base_dataset.targets, dtype=np.int64)
-        dangerous_label_set = {CIFAR100_CLASS_TO_INDEX[c] for c in dangerous_classes}
-        is_dangerous_arr = np.isin(labels, list(dangerous_label_set))
-        is_safe_arr = ~is_dangerous_arr
-
         self.cifar100 = cifar100
         self.typicality_scores = np.asarray(typicality_scores, dtype=np.float64)
         self.dangerous_classes = dangerous_classes
+        self.dangerous_percent = dangerous_percent
+        self.dangerous_policy = dangerous_policy
         self.safe_known = safe_known
         self.dangerous_known = dangerous_known
         self.known_percent = known_percent
         self.seed = seed
 
+        labels = np.asarray(cifar100.base_dataset.targets, dtype=np.int64)
+        dangerous_label_set = {CIFAR100_CLASS_TO_INDEX[c] for c in dangerous_classes}
+        candidate_dangerous = np.isin(labels, list(dangerous_label_set))
+
         rng = np.random.RandomState(seed)
+
+        if dangerous_percent >= 100.0:
+            is_dangerous_arr = candidate_dangerous.copy()
+        else:
+            is_dangerous_arr = self._select_dangerous(
+                candidate_mask=candidate_dangerous,
+                policy=dangerous_policy,
+                dangerous_percent=dangerous_percent,
+                rng=rng,
+            )
+        is_safe_arr = ~is_dangerous_arr
+
         self.is_dangerous_arr = is_dangerous_arr
         self.is_safe_arr = is_safe_arr
         self.is_label_known_arr = np.zeros(len(cifar100), dtype=bool)
@@ -642,12 +661,46 @@ class CIFAR100Safety(Dataset):
             dtype=object,
         )
 
+    def _select_dangerous(
+        self,
+        *,
+        candidate_mask: np.ndarray,
+        policy: KnownPolicy,
+        dangerous_percent: float,
+        rng: np.random.RandomState,
+    ) -> np.ndarray:
+        """From candidate dangerous-class examples, select which are actually dangerous.
+
+        With ``policy="atypical"``, the most atypical examples (lowest C-score)
+        are selected first.
+        """
+        indices = np.flatnonzero(candidate_mask)
+        result = np.zeros(len(candidate_mask), dtype=bool)
+        if len(indices) == 0:
+            return result
+
+        n_dangerous = int(round((dangerous_percent / 100.0) * len(indices)))
+        n_dangerous = max(0, min(n_dangerous, len(indices)))
+        if n_dangerous == 0:
+            return result
+
+        if policy == "random":
+            selected = rng.choice(indices, size=n_dangerous, replace=False)
+        else:
+            sorted_indices = indices[np.argsort(self.typicality_scores[indices])]
+            selected = sorted_indices[:n_dangerous]
+
+        result[selected] = True
+        return result
+
     @classmethod
     def from_cifar100(
         cls,
         cifar100: CIFAR100,
         *,
         dangerous_classes: set[str],
+        dangerous_percent: float = 100.0,
+        dangerous_policy: KnownPolicy = "atypical",
         safe_known: KnownPolicy,
         dangerous_known: KnownPolicy,
         known_percent: float,
@@ -666,6 +719,8 @@ class CIFAR100Safety(Dataset):
             cifar100,
             typicality_scores=scores,
             dangerous_classes=dangerous_classes,
+            dangerous_percent=dangerous_percent,
+            dangerous_policy=dangerous_policy,
             safe_known=safe_known,
             dangerous_known=dangerous_known,
             known_percent=known_percent,

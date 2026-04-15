@@ -1,5 +1,7 @@
 import json
+import uuid
 from dataclasses import asdict, dataclass
+from datetime import datetime
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -21,17 +23,31 @@ from src.utils import get_device, set_seed
 
 @dataclass
 class TrainSafetyClassifierConfig:
+    name: str | None = None
     seed: int = 42
     epochs: int = 50
     lr: float = 1e-4
     weight_decay: float = 1e-4
     batch_size: int = 128
     data_root: str = "data"
-    model_dir: str = "checkpoints"
-    dangerous_class: str = "airplane"
+    dangerous_class: str = "cat"
     safe_known: str = "atypical"
     dangerous_known: str = "atypical"
-    known_percents: tuple[float, ...] = (25.0, 50.0, 75.0)
+    known_percent: float = 10.0
+    experiments_root: str = "experiments"
+
+
+def _create_experiment_dir(root: str, *, name: str | None = None) -> Path:
+    experiments_root = Path(root)
+    experiments_root.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    if name:
+        exp_dir = experiments_root / f"{timestamp}_{name}"
+    else:
+        short_id = uuid.uuid4().hex[:8]
+        exp_dir = experiments_root / f"{timestamp}_{short_id}"
+    exp_dir.mkdir(parents=True)
+    return exp_dir
 
 
 def build_binary_cifar_resnet18() -> nn.Module:
@@ -221,21 +237,30 @@ def plot_metric_by_kind(
     plt.close(fig)
 
 
-def train_for_known_percent(
+def train_safety_classifier(
     *,
     config: TrainSafetyClassifierConfig,
-    known_percent: float,
     base_train_dataset: CIFAR10,
     base_eval_dataset: CIFAR10,
     device: torch.device,
 ) -> None:
+    if config.name is None:
+        config.name = uuid.uuid4().hex[:8]
+
+    experiment_dir = _create_experiment_dir(
+        config.experiments_root, name=config.name
+    )
+    with open(experiment_dir / "config.json", "w") as f:
+        json.dump(asdict(config), f, indent=2)
+    print(f"Experiment dir: {experiment_dir}")
+
     train_subset, test_subset = build_known_unknown_subsets(
         base_train_dataset=base_train_dataset,
         base_eval_dataset=base_eval_dataset,
         dangerous_class=config.dangerous_class,
         safe_known=config.safe_known,
         dangerous_known=config.dangerous_known,
-        known_percent=known_percent,
+        known_percent=config.known_percent,
         seed=config.seed,
     )
 
@@ -253,7 +278,7 @@ def train_for_known_percent(
     )
 
     print(
-        f"\nTraining safety classifier with {known_percent:.0f}% known "
+        f"\nTraining safety classifier with {config.known_percent:.0f}% known "
         f"(train={len(train_subset)}, unknown-test={len(test_subset)})"
     )
 
@@ -347,25 +372,9 @@ def train_for_known_percent(
         )
         scheduler.step()
 
-    model_dir = Path(config.model_dir)
-    model_dir.mkdir(parents=True, exist_ok=True)
-    suffix = f"{int(known_percent)}_known"
-    model_path = model_dir / f"safety_classifier_{suffix}.pt"
-    cfg_path = model_dir / f"safety_classifier_{suffix}_config.json"
-    train_csv_path = model_dir / f"safety_classifier_{suffix}_train_known_metrics.csv"
-    test_csv_path = model_dir / f"safety_classifier_{suffix}_test_unknown_metrics.csv"
-    train_loss_plot_path = (
-        model_dir / f"safety_classifier_{suffix}_train_known_loss_by_epoch.png"
-    )
-    train_acc_plot_path = (
-        model_dir / f"safety_classifier_{suffix}_train_known_accuracy_by_epoch.png"
-    )
-    test_loss_plot_path = (
-        model_dir / f"safety_classifier_{suffix}_test_unknown_loss_by_epoch.png"
-    )
-    test_acc_plot_path = (
-        model_dir / f"safety_classifier_{suffix}_test_unknown_accuracy_by_epoch.png"
-    )
+    model_path = experiment_dir / "safety_classifier.pt"
+    train_csv_path = experiment_dir / "train_known_metrics.csv"
+    test_csv_path = experiment_dir / "test_unknown_metrics.csv"
 
     torch.save({"model_state_dict": model.state_dict()}, model_path)
     train_kind_df = pl.DataFrame(train_kind_rows)
@@ -373,50 +382,41 @@ def train_for_known_percent(
     train_kind_df.write_csv(train_csv_path)
     test_kind_df.write_csv(test_csv_path)
 
+    kp = int(config.known_percent)
     plot_metric_by_kind(
         train_kind_df,
         metric="loss",
-        title=f"Train Known Loss by Kind ({int(known_percent)}% known)",
-        save_path=train_loss_plot_path,
+        title=f"Train Known Loss by Kind ({kp}% known)",
+        save_path=experiment_dir / "train_known_loss_by_epoch.png",
     )
     plot_metric_by_kind(
         train_kind_df,
         metric="accuracy",
-        title=f"Train Known Accuracy by Kind ({int(known_percent)}% known)",
-        save_path=train_acc_plot_path,
+        title=f"Train Known Accuracy by Kind ({kp}% known)",
+        save_path=experiment_dir / "train_known_accuracy_by_epoch.png",
     )
     plot_metric_by_kind(
         test_kind_df,
         metric="loss",
-        title=f"Test Unknown Loss by Kind ({int(known_percent)}% known)",
-        save_path=test_loss_plot_path,
+        title=f"Test Unknown Loss by Kind ({kp}% known)",
+        save_path=experiment_dir / "test_unknown_loss_by_epoch.png",
     )
     plot_metric_by_kind(
         test_kind_df,
         metric="accuracy",
-        title=f"Test Unknown Accuracy by Kind ({int(known_percent)}% known)",
-        save_path=test_acc_plot_path,
+        title=f"Test Unknown Accuracy by Kind ({kp}% known)",
+        save_path=experiment_dir / "test_unknown_accuracy_by_epoch.png",
     )
-
-    with open(cfg_path, "w") as f:
-        run_config = asdict(config)
-        run_config["known_percent"] = known_percent
-        run_config["train_size"] = len(train_subset)
-        run_config["unknown_test_size"] = len(test_subset)
-        json.dump(run_config, f, indent=2)
 
     print(f"Saved model to {model_path}")
-    print(f"Saved config to {cfg_path}")
     print(f"Saved train-known metrics to {train_csv_path}")
     print(f"Saved test-unknown metrics to {test_csv_path}")
-    print(f"Saved train-known loss plot to {train_loss_plot_path}")
-    print(f"Saved train-known accuracy plot to {train_acc_plot_path}")
-    print(f"Saved test-unknown loss plot to {test_loss_plot_path}")
-    print(f"Saved test-unknown accuracy plot to {test_acc_plot_path}")
 
 
-def main() -> None:
-    config = TrainSafetyClassifierConfig()
+def main(config: TrainSafetyClassifierConfig) -> None:
+    if config.name is None:
+        config.name = uuid.uuid4().hex[:8]
+
     set_seed(config.seed)
     device = get_device()
     print(f"Using device: {device}")
@@ -428,15 +428,33 @@ def main() -> None:
         train=True, root=config.data_root, transform=get_eval_transform()
     )
 
-    for known_percent in config.known_percents:
-        train_for_known_percent(
-            config=config,
-            known_percent=known_percent,
-            base_train_dataset=base_train_dataset,
-            base_eval_dataset=base_eval_dataset,
-            device=device,
-        )
+    train_safety_classifier(
+        config=config,
+        base_train_dataset=base_train_dataset,
+        base_eval_dataset=base_eval_dataset,
+        device=device,
+    )
 
 
 if __name__ == "__main__":
-    main()
+    base_config = TrainSafetyClassifierConfig()
+    known_percents = [1, 5, 10, 25, 50]
+
+    configs: list[TrainSafetyClassifierConfig] = []
+    for known_percent in known_percents:
+        configs.append(
+            TrainSafetyClassifierConfig(
+                **{
+                    **asdict(base_config),
+                    "name": f"safety_classifier_{base_config.dangerous_class}_{known_percent}p",
+                    "known_percent": float(known_percent),
+                }
+            )
+        )
+
+    print(f"Running {len(configs)} experiments")
+    for i, config in enumerate(configs, 1):
+        print(f"\n{'=' * 60}")
+        print(f"[{i}/{len(configs)}] {config.name}")
+        print(f"{'=' * 60}")
+        main(config)

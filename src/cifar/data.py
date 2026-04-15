@@ -344,19 +344,19 @@ class CIFAR10Safety(Dataset):
         cifar10: CIFAR10,
         *,
         typicality_scores: np.ndarray,
-        dangerous_class: str,
-        safe_known: KnownPolicy,
-        dangerous_known: KnownPolicy,
-        known_percent: float,
-        seed: int = 42,
+        dangerous_classes: set[str],
+        unknown_classes: set[str] = frozenset(),
     ):
-        if dangerous_class not in CLASS_TO_INDEX:
-            raise ValueError(
-                f"dangerous_class must be one of {CIFAR10_CLASSES}, got '{dangerous_class}'"
-            )
-        if not (0.0 <= known_percent <= 100.0):
-            raise ValueError(f"known_percent must be in [0, 100], got {known_percent}")
-
+        for cls_name in dangerous_classes:
+            if cls_name not in CLASS_TO_INDEX:
+                raise ValueError(
+                    f"dangerous class must be one of {CIFAR10_CLASSES}, got '{cls_name}'"
+                )
+        for cls_name in unknown_classes:
+            if cls_name not in CLASS_TO_INDEX:
+                raise ValueError(
+                    f"unknown class must be one of {CIFAR10_CLASSES}, got '{cls_name}'"
+                )
         if len(typicality_scores) != len(cifar10):
             raise ValueError(
                 "typicality_scores length does not match dataset length: "
@@ -364,35 +364,18 @@ class CIFAR10Safety(Dataset):
             )
 
         labels = np.asarray(cifar10.base_dataset.targets, dtype=np.int64)
-        dangerous_label = CLASS_TO_INDEX[dangerous_class]
-        is_dangerous_arr = labels == dangerous_label
-        is_safe_arr = ~is_dangerous_arr
+        dangerous_label_set = {CLASS_TO_INDEX[c] for c in dangerous_classes}
+        unknown_label_set = {CLASS_TO_INDEX[c] for c in unknown_classes}
 
         self.cifar10 = cifar10
         self.typicality_scores = np.asarray(typicality_scores, dtype=np.float64)
-        self.dangerous_class = dangerous_class
-        self.safe_known = safe_known
-        self.dangerous_known = dangerous_known
-        self.known_percent = known_percent
-        self.seed = seed
+        self.dangerous_classes = dangerous_classes
+        self.unknown_classes = unknown_classes
 
-        rng = np.random.RandomState(seed)
-        self.is_dangerous_arr = is_dangerous_arr
-        self.is_safe_arr = is_safe_arr
-        self.is_label_known_arr = np.zeros(len(cifar10), dtype=bool)
+        self.is_dangerous_arr = np.isin(labels, list(dangerous_label_set))
+        self.is_safe_arr = ~self.is_dangerous_arr
+        self.is_label_known_arr = ~np.isin(labels, list(unknown_label_set))
 
-        self._assign_known_labels(
-            mask=is_safe_arr,
-            policy=safe_known,
-            known_percent=known_percent,
-            rng=rng,
-        )
-        self._assign_known_labels(
-            mask=is_dangerous_arr,
-            policy=dangerous_known,
-            known_percent=known_percent,
-            rng=rng,
-        )
         self.kind_arr = np.asarray(
             [
                 self._kind(bool(is_known), bool(is_dangerous))
@@ -410,11 +393,8 @@ class CIFAR10Safety(Dataset):
         cls,
         cifar10: CIFAR10,
         *,
-        dangerous_class: str,
-        safe_known: KnownPolicy,
-        dangerous_known: KnownPolicy,
-        known_percent: float,
-        seed: int = 42,
+        dangerous_classes: set[str],
+        unknown_classes: set[str] = frozenset(),
         cscore_path: Path | str = DEFAULT_CSCORE_PATH,
         cscore_url: str = CSCORE_URL,
     ) -> "CIFAR10Safety":
@@ -428,37 +408,9 @@ class CIFAR10Safety(Dataset):
         return cls(
             cifar10,
             typicality_scores=scores,
-            dangerous_class=dangerous_class,
-            safe_known=safe_known,
-            dangerous_known=dangerous_known,
-            known_percent=known_percent,
-            seed=seed,
+            dangerous_classes=dangerous_classes,
+            unknown_classes=unknown_classes,
         )
-
-    def _assign_known_labels(
-        self,
-        *,
-        mask: np.ndarray,
-        policy: KnownPolicy,
-        known_percent: float,
-        rng: np.random.RandomState,
-    ) -> None:
-        indices = np.flatnonzero(mask)
-        if len(indices) == 0:
-            return
-
-        n_known = int(round((known_percent / 100.0) * len(indices)))
-        n_known = max(0, min(n_known, len(indices)))
-        if n_known == 0:
-            return
-
-        if policy == "random":
-            known_indices = rng.choice(indices, size=n_known, replace=False)
-        else:
-            sorted_indices = indices[np.argsort(self.typicality_scores[indices])[::-1]]
-            known_indices = sorted_indices[:n_known]
-
-        self.is_label_known_arr[known_indices] = True
 
     def _kind(self, is_known: bool, is_dangerous: bool) -> SafetyKind:
         if is_known and not is_dangerous:
@@ -582,75 +534,37 @@ class CIFAR100Safety(Dataset):
         *,
         typicality_scores: np.ndarray,
         dangerous_classes: set[str],
-        dangerous_percent: float = 100.0,
-        dangerous_policy: KnownPolicy = "atypical",
-        safe_known: KnownPolicy,
-        dangerous_known: KnownPolicy,
-        known_percent: float,
-        seed: int = 42,
+        unknown_classes: set[str] = frozenset(),
     ):
         for cls_name in dangerous_classes:
             if cls_name not in CIFAR100_CLASS_TO_INDEX:
                 raise ValueError(
                     f"dangerous class must be one of CIFAR100_CLASSES, got '{cls_name}'"
                 )
-        if not (0.0 <= known_percent <= 100.0):
-            raise ValueError(f"known_percent must be in [0, 100], got {known_percent}")
-        if not (0.0 <= dangerous_percent <= 100.0):
-            raise ValueError(
-                f"dangerous_percent must be in [0, 100], got {dangerous_percent}"
-            )
+        for cls_name in unknown_classes:
+            if cls_name not in CIFAR100_CLASS_TO_INDEX:
+                raise ValueError(
+                    f"unknown class must be one of CIFAR100_CLASSES, got '{cls_name}'"
+                )
         if len(typicality_scores) != len(cifar100):
             raise ValueError(
                 "typicality_scores length does not match dataset length: "
                 f"{len(typicality_scores)} vs {len(cifar100)}"
             )
 
+        labels = np.asarray(cifar100.base_dataset.targets, dtype=np.int64)
+        dangerous_label_set = {CIFAR100_CLASS_TO_INDEX[c] for c in dangerous_classes}
+        unknown_label_set = {CIFAR100_CLASS_TO_INDEX[c] for c in unknown_classes}
+
         self.cifar100 = cifar100
         self.typicality_scores = np.asarray(typicality_scores, dtype=np.float64)
         self.dangerous_classes = dangerous_classes
-        self.dangerous_percent = dangerous_percent
-        self.dangerous_policy = dangerous_policy
-        self.safe_known = safe_known
-        self.dangerous_known = dangerous_known
-        self.known_percent = known_percent
-        self.seed = seed
+        self.unknown_classes = unknown_classes
 
-        labels = np.asarray(cifar100.base_dataset.targets, dtype=np.int64)
-        dangerous_label_set = {CIFAR100_CLASS_TO_INDEX[c] for c in dangerous_classes}
-        candidate_dangerous = np.isin(labels, list(dangerous_label_set))
+        self.is_dangerous_arr = np.isin(labels, list(dangerous_label_set))
+        self.is_safe_arr = ~self.is_dangerous_arr
+        self.is_label_known_arr = ~np.isin(labels, list(unknown_label_set))
 
-        rng = np.random.RandomState(seed)
-
-        if dangerous_percent >= 100.0:
-            is_dangerous_arr = candidate_dangerous.copy()
-        else:
-            is_dangerous_arr = self._select_dangerous(
-                candidate_mask=candidate_dangerous,
-                policy=dangerous_policy,
-                dangerous_percent=dangerous_percent,
-                rng=rng,
-            )
-        is_safe_arr = ~is_dangerous_arr
-
-        self.is_dangerous_arr = is_dangerous_arr
-        self.is_safe_arr = is_safe_arr
-        self.is_label_known_arr = np.zeros(len(cifar100), dtype=bool)
-
-        self._assign_known_labels(
-            mask=is_safe_arr,
-            policy=safe_known,
-            known_percent=known_percent,
-            rng=rng,
-            labels=labels,
-        )
-        self._assign_known_labels(
-            mask=is_dangerous_arr,
-            policy=dangerous_known,
-            known_percent=known_percent,
-            rng=rng,
-            labels=labels,
-        )
         self.kind_arr = np.asarray(
             [
                 self._kind(bool(is_known), bool(is_dangerous))
@@ -663,50 +577,13 @@ class CIFAR100Safety(Dataset):
             dtype=object,
         )
 
-    def _select_dangerous(
-        self,
-        *,
-        candidate_mask: np.ndarray,
-        policy: KnownPolicy,
-        dangerous_percent: float,
-        rng: np.random.RandomState,
-    ) -> np.ndarray:
-        """From candidate dangerous-class examples, select which are actually dangerous.
-
-        With ``policy="atypical"``, the most atypical examples (lowest C-score)
-        are selected first.
-        """
-        indices = np.flatnonzero(candidate_mask)
-        result = np.zeros(len(candidate_mask), dtype=bool)
-        if len(indices) == 0:
-            return result
-
-        n_dangerous = int(round((dangerous_percent / 100.0) * len(indices)))
-        n_dangerous = max(0, min(n_dangerous, len(indices)))
-        if n_dangerous == 0:
-            return result
-
-        if policy == "random":
-            selected = rng.choice(indices, size=n_dangerous, replace=False)
-        else:
-            sorted_indices = indices[np.argsort(self.typicality_scores[indices])]
-            selected = sorted_indices[:n_dangerous]
-
-        result[selected] = True
-        return result
-
     @classmethod
     def from_cifar100(
         cls,
         cifar100: CIFAR100,
         *,
         dangerous_classes: set[str],
-        dangerous_percent: float = 100.0,
-        dangerous_policy: KnownPolicy = "atypical",
-        safe_known: KnownPolicy,
-        dangerous_known: KnownPolicy,
-        known_percent: float,
-        seed: int = 42,
+        unknown_classes: set[str] = frozenset(),
         cscore_path: Path | str = CIFAR100_DEFAULT_CSCORE_PATH,
         cscore_url: str = CIFAR100_CSCORE_URL,
     ) -> "CIFAR100Safety":
@@ -721,43 +598,8 @@ class CIFAR100Safety(Dataset):
             cifar100,
             typicality_scores=scores,
             dangerous_classes=dangerous_classes,
-            dangerous_percent=dangerous_percent,
-            dangerous_policy=dangerous_policy,
-            safe_known=safe_known,
-            dangerous_known=dangerous_known,
-            known_percent=known_percent,
-            seed=seed,
+            unknown_classes=unknown_classes,
         )
-
-    def _assign_known_labels(
-        self,
-        *,
-        mask: np.ndarray,
-        policy: KnownPolicy,
-        known_percent: float,
-        rng: np.random.RandomState,
-        labels: np.ndarray,
-    ) -> None:
-        """Mark known_percent of each class's masked examples as known."""
-        for class_idx in np.unique(labels[mask]):
-            indices = np.flatnonzero(mask & (labels == class_idx))
-            if len(indices) == 0:
-                continue
-
-            n_known = int(round((known_percent / 100.0) * len(indices)))
-            n_known = max(0, min(n_known, len(indices)))
-            if n_known == 0:
-                continue
-
-            if policy == "random":
-                known_indices = rng.choice(indices, size=n_known, replace=False)
-            else:
-                sorted_indices = indices[
-                    np.argsort(self.typicality_scores[indices])[::-1]
-                ]
-                known_indices = sorted_indices[:n_known]
-
-            self.is_label_known_arr[known_indices] = True
 
     def _kind(self, is_known: bool, is_dangerous: bool) -> SafetyKind:
         if is_known and not is_dangerous:

@@ -26,7 +26,6 @@ from src.cifar.train_resnet import (
     CifarVariant,
     build_cifar_resnet18,
     get_eval_transform,
-    validate_known_policy,
 )
 from src.utils import get_device, set_seed
 
@@ -73,12 +72,8 @@ class UnlearnConfig:
     log_every_n_steps: int = 500
 
     data_root: str = "data"
-    dangerous_class: str = "seal"
-    dangerous_percent: float = 50.0
-    dangerous_policy: str = "atypical"
-    safe_known: str = "atypical"
-    dangerous_known: str = "atypical"
-    known_percent: float = 10
+    dangerous_classes: tuple[str, ...] = ("man", "boy")
+    unknown_classes: tuple[str, ...] = ("girl", "boy")
     unlearning_strategy: UnlearningStrategy = "ignore-unknown"
 
     pretrained_model_path: str = "checkpoints/cifar100/train_resnet.pt"
@@ -144,14 +139,14 @@ def _eval_by_kind(
     loader: DataLoader,
     device: torch.device,
     *,
-    dangerous_class_idx: int | None = None,
+    dangerous_class_idxs: set[int] | None = None,
 ) -> tuple[dict[str, dict[str, float]], dict[str, dict[str, float]]]:
     """Evaluate model on safety dataset.
 
     Returns (global_metrics, dclass_metrics).  *global_metrics* contains
     per-kind and safe/dangerous aggregate entries.  *dclass_metrics* contains
-    per-kind entries restricted to examples whose CIFAR label matches
-    ``dangerous_class_idx`` (empty dict when the arg is ``None``).
+    per-kind entries restricted to examples whose CIFAR label is in
+    ``dangerous_class_idxs`` (empty dict when the arg is ``None``).
     """
     model.eval()
     criterion = nn.CrossEntropyLoss(reduction="none")
@@ -162,7 +157,12 @@ def _eval_by_kind(
     correct_top5 = torch.zeros(n_kinds, dtype=torch.long, device=device)
     loss_sum = torch.zeros(n_kinds, dtype=torch.double, device=device)
 
-    track_dclass = dangerous_class_idx is not None
+    track_dclass = dangerous_class_idxs is not None and len(dangerous_class_idxs) > 0
+    dc_label_tensor = (
+        torch.tensor(sorted(dangerous_class_idxs), device=device)
+        if track_dclass
+        else None
+    )
     dc_counts = torch.zeros(n_kinds, dtype=torch.long, device=device)
     dc_top1 = torch.zeros(n_kinds, dtype=torch.long, device=device)
     dc_top5 = torch.zeros(n_kinds, dtype=torch.long, device=device)
@@ -190,7 +190,7 @@ def _eval_by_kind(
         loss_sum.scatter_add_(0, kind_indices, per_loss.double())
 
         if track_dclass:
-            dc_mask = labels == dangerous_class_idx
+            dc_mask = torch.isin(labels, dc_label_tensor)
             if dc_mask.any():
                 dc_ki = kind_indices[dc_mask]
                 dc_counts.scatter_add_(0, dc_ki, torch.ones_like(dc_ki))
@@ -367,13 +367,13 @@ def _run_eval(
     *,
     eval_loader: DataLoader,
     device: torch.device,
-    dangerous_class_idx: int | None,
+    dangerous_class_idxs: set[int] | None,
     step: int,
     eval_rows: list[dict[str, float | str]],
     dclass_rows: list[dict[str, float | str]],
 ) -> dict[str, dict[str, float]]:
     kind_metrics, dclass_metrics = _eval_by_kind(
-        model, eval_loader, device, dangerous_class_idx=dangerous_class_idx
+        model, eval_loader, device, dangerous_class_idxs=dangerous_class_idxs
     )
     for group in ALL_GROUPS:
         eval_rows.append({"step": float(step), "group": group, **kind_metrics[group]})
@@ -404,9 +404,8 @@ def main(config: UnlearnConfig) -> None:
     print(f"  max_grad_norm: {config.max_grad_norm}")
     print(f"  batch_size: {config.batch_size}")
     print(f"  eval_every_n_steps: {config.eval_every_n_steps}")
-    print(f"  dangerous_percent: {config.dangerous_percent}")
-    print(f"  dangerous_policy: {config.dangerous_policy}")
-    print(f"  known_percent: {config.known_percent}")
+    print(f"  dangerous_classes: {config.dangerous_classes}")
+    print(f"  unknown_classes: {config.unknown_classes}")
     print(f"  unlearning_strategy: {config.unlearning_strategy}")
 
     retain_kinds, forget_kinds = _strategy_to_kinds(config.unlearning_strategy)
@@ -417,6 +416,9 @@ def main(config: UnlearnConfig) -> None:
         json.dump(asdict(config), f, indent=2)
     print(f"Experiment dir: {experiment_dir}")
 
+    dangerous_set = set(config.dangerous_classes)
+    unknown_set = set(config.unknown_classes)
+
     eval_transform = get_eval_transform()
     if config.dataset == "cifar100":
         cifar_train = CIFAR100(
@@ -424,13 +426,8 @@ def main(config: UnlearnConfig) -> None:
         )
         safety_dataset: SafetyDataset = CIFAR100Safety.from_cifar100(
             cifar_train,
-            dangerous_classes={config.dangerous_class},
-            dangerous_percent=config.dangerous_percent,
-            dangerous_policy=validate_known_policy(config.dangerous_policy),
-            safe_known=validate_known_policy(config.safe_known),
-            dangerous_known=validate_known_policy(config.dangerous_known),
-            known_percent=config.known_percent,
-            seed=config.seed,
+            dangerous_classes=dangerous_set,
+            unknown_classes=unknown_set,
         )
     else:
         cifar_train = CIFAR10(
@@ -438,11 +435,8 @@ def main(config: UnlearnConfig) -> None:
         )
         safety_dataset = CIFAR10Safety.from_cifar10(
             cifar_train,
-            dangerous_class=config.dangerous_class,
-            safe_known=validate_known_policy(config.safe_known),
-            dangerous_known=validate_known_policy(config.dangerous_known),
-            known_percent=config.known_percent,
-            seed=config.seed,
+            dangerous_classes=dangerous_set,
+            unknown_classes=unknown_set,
         )
 
     train_subset = _build_mode_subset(
@@ -496,18 +490,17 @@ def main(config: UnlearnConfig) -> None:
     criterion = nn.CrossEntropyLoss(reduction="none")
 
     if config.dataset == "cifar100":
-        dangerous_class_idx: int | None = CIFAR100_CLASS_TO_INDEX.get(
-            config.dangerous_class
-        )
+        class_to_idx = CIFAR100_CLASS_TO_INDEX
     else:
-        dangerous_class_idx = CLASS_TO_INDEX.get(config.dangerous_class)
+        class_to_idx = CLASS_TO_INDEX
+    dangerous_class_idxs = {class_to_idx[c] for c in config.dangerous_classes}
 
     eval_rows: list[dict[str, float | str]] = []
     dclass_rows: list[dict[str, float | str]] = []
     eval_kwargs = dict(
         eval_loader=eval_loader,
         device=device,
-        dangerous_class_idx=dangerous_class_idx,
+        dangerous_class_idxs=dangerous_class_idxs,
         eval_rows=eval_rows,
         dclass_rows=dclass_rows,
     )
@@ -587,7 +580,7 @@ def main(config: UnlearnConfig) -> None:
     if dclass_df is not None:
         dclass_df.write_csv(experiment_dir / "dclass_metrics.csv")
 
-    dclass_label = config.dangerous_class.capitalize()
+    dclass_label = "+".join(c.capitalize() for c in config.dangerous_classes)
 
     for metric in ("top1_acc", "top5_acc", "loss"):
         display = _METRIC_DISPLAY.get(metric, metric)
@@ -657,22 +650,19 @@ if __name__ == "__main__":
         "forget-unknown",
         "retain-unknown",
     ]
-    labeled_percents = [10, 20, 50, 90]
 
     configs: list[UnlearnConfig] = []
     for strategy in strategies:
-        for known_percent in labeled_percents:
-            tag = strategy.replace("-", "_")
-            configs.append(
-                UnlearnConfig(
-                    **{
-                        **asdict(base_config),
-                        "name": f"{tag}_{known_percent}p",
-                        "known_percent": float(known_percent),
-                        "unlearning_strategy": strategy,
-                    }
-                )
+        tag = strategy.replace("-", "_")
+        configs.append(
+            UnlearnConfig(
+                **{
+                    **asdict(base_config),
+                    "name": tag,
+                    "unlearning_strategy": strategy,
+                }
             )
+        )
 
     print(f"Running {len(configs)} experiments")
     for i, config in enumerate(configs, 1):

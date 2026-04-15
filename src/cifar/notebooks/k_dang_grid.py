@@ -6,12 +6,11 @@ import numpy as np
 import torch
 
 from src.cifar.data import CIFAR100, CIFAR100_CLASSES, CIFAR100Safety
-from src.cifar.train_resnet import get_eval_transform, validate_known_policy
+from src.cifar.train_resnet import get_eval_transform
 from src.cifar.unlearn import UnlearnConfig
 
 # %%
 cfg = UnlearnConfig()
-known_percent = 1.0
 
 cifar100_train = CIFAR100(
     train=True,
@@ -20,11 +19,8 @@ cifar100_train = CIFAR100(
 )
 safety: CIFAR100Safety = CIFAR100Safety.from_cifar100(
     cifar100_train,
-    dangerous_classes={cfg.dangerous_class},
-    safe_known=validate_known_policy(cfg.safe_known),
-    dangerous_known=validate_known_policy(cfg.dangerous_known),
-    known_percent=known_percent,
-    seed=cfg.seed,
+    dangerous_classes=set(cfg.dangerous_classes),
+    unknown_classes=set(cfg.unknown_classes),
 )
 
 # %%
@@ -36,9 +32,8 @@ kdang_idx = kdang_idx[order]
 
 n = len(kdang_idx)
 print(
-    f"CIFAR100Safety: dangerous={cfg.dangerous_class!r}, "
-    f"known_percent={known_percent}%, seed={cfg.seed}, "
-    f"policies safe/dang={cfg.safe_known!r}/{cfg.dangerous_known!r}"
+    f"CIFAR100Safety: dangerous={cfg.dangerous_classes!r}, "
+    f"unknown={cfg.unknown_classes!r}, seed={cfg.seed}"
 )
 print(f"k-dang count: {n}")
 
@@ -49,6 +44,7 @@ std = torch.tensor([0.2023, 0.1994, 0.2010]).view(3, 1, 1)
 def denorm_chw(t: torch.Tensor) -> np.ndarray:
     x = (t * std + mean).clamp(0, 1).permute(1, 2, 0).numpy()
     return x
+
 
 # %%
 if n == 0:

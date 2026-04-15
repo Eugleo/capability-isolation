@@ -60,20 +60,20 @@ if len(experiments) >= 2:
     ref = experiments[0]["config"]
     for exp in experiments[1:]:
         cfg = exp["config"]
-        if cfg.get("dangerous_class") != ref.get("dangerous_class"):
+        if cfg.get("dangerous_classes") != ref.get("dangerous_classes"):
             warnings.warn(
-                f"dangerous_class mismatch: {exp['label']} has "
-                f"'{cfg.get('dangerous_class')}' vs reference '{ref.get('dangerous_class')}'"
+                f"dangerous_classes mismatch: {exp['label']} has "
+                f"'{cfg.get('dangerous_classes')}' vs reference '{ref.get('dangerous_classes')}'"
             )
-        for key in ("safe_known", "dangerous_known"):
-            if cfg.get(key) != ref.get(key):
-                warnings.warn(
-                    f"{key} mismatch: {exp['label']} has "
-                    f"'{cfg.get(key)}' vs reference '{ref.get(key)}'"
-                )
+        if cfg.get("unknown_classes") != ref.get("unknown_classes"):
+            warnings.warn(
+                f"unknown_classes mismatch: {exp['label']} has "
+                f"'{cfg.get('unknown_classes')}' vs reference '{ref.get('unknown_classes')}'"
+            )
 
 # %%
-dangerous_class = experiments[0]["config"]["dangerous_class"] if experiments else "cat"
+dangerous_classes = experiments[0]["config"]["dangerous_classes"] if experiments else ["cat"]
+dangerous_label = "+".join(dangerous_classes)
 
 fig, ax = plt.subplots(figsize=(8, 8))
 cmap = plt.get_cmap("tab10")
@@ -88,8 +88,8 @@ for i, exp in enumerate(experiments):
 
     for step in steps:
         step_df = df.filter(pl.col("step") == step)
-        dang = step_df.filter(pl.col("class") == dangerous_class)["accuracy"].item()
-        others = step_df.filter(pl.col("class") != dangerous_class)["accuracy"].mean()
+        dang = step_df.filter(pl.col("class").is_in(dangerous_classes))["accuracy"].mean()
+        others = step_df.filter(~pl.col("class").is_in(dangerous_classes))["accuracy"].mean()
         other_acc_pct.append(float(others) * 100)
         forget_quality_pct.append((1.0 - float(dang)) * 100)
 
@@ -113,7 +113,7 @@ for i, exp in enumerate(experiments):
 
 ax.set_xlabel("\u2191 Safe Utility (acc %)", fontsize=12)
 ax.set_ylabel(
-    f"\u2191 Dangerous Unlearning (1 \u2212 {dangerous_class} acc %)",
+    f"\u2191 Dangerous Unlearning (1 \u2212 {dangerous_label} acc %)",
     fontsize=12,
 )
 ax.set_xlim(0, 100)

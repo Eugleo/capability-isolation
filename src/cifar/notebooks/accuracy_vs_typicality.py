@@ -27,11 +27,8 @@ print(f"Loaded model on {device}")
 cifar100_train = CIFAR100(train=True, root="data")
 cifar100_safety = CIFAR100Safety.from_cifar100(
     cifar100_train,
-    dangerous_classes={"crab"},
-    safe_known="random",
-    dangerous_known="random",
-    known_percent=50.0,
-    seed=42,
+    dangerous_classes={"man", "boy"},
+    unknown_classes={"girl", "boy"},
 )
 
 train_labels = np.asarray(cifar100_train.base_dataset.targets, dtype=np.int64)

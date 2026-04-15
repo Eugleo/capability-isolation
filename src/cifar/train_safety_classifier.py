@@ -16,7 +16,6 @@ from src.cifar.data import CIFAR10, CIFAR10Safety
 from src.cifar.train_resnet import (
     get_eval_transform,
     get_train_transform,
-    validate_known_policy,
 )
 from src.utils import get_device, set_seed
 
@@ -30,10 +29,8 @@ class TrainSafetyClassifierConfig:
     weight_decay: float = 1e-4
     batch_size: int = 128
     data_root: str = "data"
-    dangerous_class: str = "cat"
-    safe_known: str = "atypical"
-    dangerous_known: str = "atypical"
-    known_percent: float = 10.0
+    dangerous_classes: tuple[str, ...] = ("cat",)
+    unknown_classes: tuple[str, ...] = ()
     experiments_root: str = "experiments"
 
 
@@ -76,27 +73,18 @@ def build_known_unknown_subsets(
     *,
     base_train_dataset: CIFAR10,
     base_eval_dataset: CIFAR10,
-    dangerous_class: str,
-    safe_known: str,
-    dangerous_known: str,
-    known_percent: float,
-    seed: int,
+    dangerous_classes: set[str],
+    unknown_classes: set[str] = frozenset(),
 ) -> tuple[Subset[CIFAR10Safety], Subset[CIFAR10Safety]]:
     train_safety = CIFAR10Safety.from_cifar10(
         base_train_dataset,
-        dangerous_class=dangerous_class,
-        safe_known=validate_known_policy(safe_known),
-        dangerous_known=validate_known_policy(dangerous_known),
-        known_percent=known_percent,
-        seed=seed,
+        dangerous_classes=dangerous_classes,
+        unknown_classes=unknown_classes,
     )
     test_safety = CIFAR10Safety.from_cifar10(
         base_eval_dataset,
-        dangerous_class=dangerous_class,
-        safe_known=validate_known_policy(safe_known),
-        dangerous_known=validate_known_policy(dangerous_known),
-        known_percent=known_percent,
-        seed=seed,
+        dangerous_classes=dangerous_classes,
+        unknown_classes=unknown_classes,
     )
     train_subset = _subset_from_mask(
         train_safety,
@@ -257,11 +245,8 @@ def train_safety_classifier(
     train_subset, test_subset = build_known_unknown_subsets(
         base_train_dataset=base_train_dataset,
         base_eval_dataset=base_eval_dataset,
-        dangerous_class=config.dangerous_class,
-        safe_known=config.safe_known,
-        dangerous_known=config.dangerous_known,
-        known_percent=config.known_percent,
-        seed=config.seed,
+        dangerous_classes=set(config.dangerous_classes),
+        unknown_classes=set(config.unknown_classes),
     )
 
     train_loader = DataLoader(
@@ -278,7 +263,7 @@ def train_safety_classifier(
     )
 
     print(
-        f"\nTraining safety classifier with {config.known_percent:.0f}% known "
+        f"\nTraining safety classifier "
         f"(train={len(train_subset)}, unknown-test={len(test_subset)})"
     )
 
@@ -382,29 +367,28 @@ def train_safety_classifier(
     train_kind_df.write_csv(train_csv_path)
     test_kind_df.write_csv(test_csv_path)
 
-    kp = int(config.known_percent)
     plot_metric_by_kind(
         train_kind_df,
         metric="loss",
-        title=f"Train Known Loss by Kind ({kp}% known)",
+        title="Train Known Loss by Kind",
         save_path=experiment_dir / "train_known_loss_by_epoch.png",
     )
     plot_metric_by_kind(
         train_kind_df,
         metric="accuracy",
-        title=f"Train Known Accuracy by Kind ({kp}% known)",
+        title="Train Known Accuracy by Kind",
         save_path=experiment_dir / "train_known_accuracy_by_epoch.png",
     )
     plot_metric_by_kind(
         test_kind_df,
         metric="loss",
-        title=f"Test Unknown Loss by Kind ({kp}% known)",
+        title="Test Unknown Loss by Kind",
         save_path=experiment_dir / "test_unknown_loss_by_epoch.png",
     )
     plot_metric_by_kind(
         test_kind_df,
         metric="accuracy",
-        title=f"Test Unknown Accuracy by Kind ({kp}% known)",
+        title="Test Unknown Accuracy by Kind",
         save_path=experiment_dir / "test_unknown_accuracy_by_epoch.png",
     )
 
@@ -437,24 +421,7 @@ def main(config: TrainSafetyClassifierConfig) -> None:
 
 
 if __name__ == "__main__":
-    base_config = TrainSafetyClassifierConfig()
-    known_percents = [1, 5, 10, 25, 50]
-
-    configs: list[TrainSafetyClassifierConfig] = []
-    for known_percent in known_percents:
-        configs.append(
-            TrainSafetyClassifierConfig(
-                **{
-                    **asdict(base_config),
-                    "name": f"safety_classifier_{base_config.dangerous_class}_{known_percent}p",
-                    "known_percent": float(known_percent),
-                }
-            )
-        )
-
-    print(f"Running {len(configs)} experiments")
-    for i, config in enumerate(configs, 1):
-        print(f"\n{'=' * 60}")
-        print(f"[{i}/{len(configs)}] {config.name}")
-        print(f"{'=' * 60}")
-        main(config)
+    config = TrainSafetyClassifierConfig()
+    dang_tag = "_".join(config.dangerous_classes)
+    config.name = f"safety_classifier_{dang_tag}"
+    main(config)

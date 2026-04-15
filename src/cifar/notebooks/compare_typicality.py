@@ -9,22 +9,11 @@ from src.cifar.data import (
 )
 
 # %%
-# Safety labeling hyperparameters do not affect typicality itself,
-# but are required to construct CIFAR10Safety.
-dangerous_class = "crab"
-safe_known = "random"
-dangerous_known = "random"
-known_percent = 50.0
-seed = 42
-
 cifar100_train = CIFAR100(train=True, root="data")
 cifar100_safety = CIFAR100Safety.from_cifar100(
     cifar100_train,
-    dangerous_classes={dangerous_class},
-    safe_known=safe_known,
-    dangerous_known=dangerous_known,
-    known_percent=known_percent,
-    seed=seed,
+    dangerous_classes={"man", "boy"},
+    unknown_classes={"girl", "boy"},
 )
 
 labels = np.asarray(cifar100_train.base_dataset.targets, dtype=np.int64)

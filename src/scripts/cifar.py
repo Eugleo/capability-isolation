@@ -34,11 +34,8 @@ plt.show()
 # %%
 safety_dataset = CIFAR10Safety.from_cifar10(
     train_cifar,
-    dangerous_class="airplane",
-    safe_known="random",
-    dangerous_known="atypical",
-    known_percent=90,
-    seed=SEED,
+    dangerous_classes={"airplane"},
+    unknown_classes={"automobile"},
 )
 
 # %%

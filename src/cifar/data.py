@@ -642,12 +642,14 @@ class CIFAR100Safety(Dataset):
             policy=safe_known,
             known_percent=known_percent,
             rng=rng,
+            labels=labels,
         )
         self._assign_known_labels(
             mask=is_dangerous_arr,
             policy=dangerous_known,
             known_percent=known_percent,
             rng=rng,
+            labels=labels,
         )
         self.kind_arr = np.asarray(
             [
@@ -734,23 +736,28 @@ class CIFAR100Safety(Dataset):
         policy: KnownPolicy,
         known_percent: float,
         rng: np.random.RandomState,
+        labels: np.ndarray,
     ) -> None:
-        indices = np.flatnonzero(mask)
-        if len(indices) == 0:
-            return
+        """Mark known_percent of each class's masked examples as known."""
+        for class_idx in np.unique(labels[mask]):
+            indices = np.flatnonzero(mask & (labels == class_idx))
+            if len(indices) == 0:
+                continue
 
-        n_known = int(round((known_percent / 100.0) * len(indices)))
-        n_known = max(0, min(n_known, len(indices)))
-        if n_known == 0:
-            return
+            n_known = int(round((known_percent / 100.0) * len(indices)))
+            n_known = max(0, min(n_known, len(indices)))
+            if n_known == 0:
+                continue
 
-        if policy == "random":
-            known_indices = rng.choice(indices, size=n_known, replace=False)
-        else:
-            sorted_indices = indices[np.argsort(self.typicality_scores[indices])[::-1]]
-            known_indices = sorted_indices[:n_known]
+            if policy == "random":
+                known_indices = rng.choice(indices, size=n_known, replace=False)
+            else:
+                sorted_indices = indices[
+                    np.argsort(self.typicality_scores[indices])[::-1]
+                ]
+                known_indices = sorted_indices[:n_known]
 
-        self.is_label_known_arr[known_indices] = True
+            self.is_label_known_arr[known_indices] = True
 
     def _kind(self, is_known: bool, is_dangerous: bool) -> SafetyKind:
         if is_known and not is_dangerous:

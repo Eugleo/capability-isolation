@@ -147,19 +147,16 @@ def build_unlearn_configs_for_dangerous_grid(
         unknown_safe = sorted(unknown_names - dangerous_set)
         known_safe = sorted(known_classes_set - dangerous_set)
 
-        n_u = min(3, len(unknown_safe))
-        n_k = min(3, len(known_safe))
-        subsample_classes = (
-            list(dangerous_classes)
-            + random.sample(unknown_safe, n_u)
-            + random.sample(known_safe, n_k)
-        )
+        n_k_safe = min(5, len(known_safe))
+        n_u_safe = min(5, len(unknown_safe))
+        subsampled_classes = list(dangerous_classes)
+        subsampled_classes.extend(random.sample(known_safe, n_k_safe))
+        subsampled_classes.extend(random.sample(unknown_safe, n_u_safe))
 
         pct_tag = int(round(100 * k / n_dang))
         eval_class_groups: dict[str, tuple[str, ...]] = {
             "all": class_names,
-            "unknown": tuple(sorted(dangerous_set | unknown_names)),
-            "subsample": tuple(sorted(subsample_classes)),
+            "subsampled": tuple(sorted(subsampled_classes)),
         }
 
         for strategy in strategies:
@@ -477,7 +474,8 @@ def _plot_lines(
                     xytext=(6, 0),
                     textcoords="offset points",
                     color=color,
-                    fontsize=8,
+                    fontsize=5,
+                    alpha=0.5,
                     va="center",
                     clip_on=False,
                 )

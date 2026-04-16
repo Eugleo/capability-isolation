@@ -356,18 +356,36 @@ def _plot_lines(
                     color=color,
                     fontsize=8,
                     va="center",
-                    clip_on=True,
+                    clip_on=False,
                 )
     ax.set_xlabel("Step")
     ax.set_ylabel(display)
     ax.set_title(title)
     if metric in ("top1_acc", "top5_acc"):
-        ax.set_ylim(0, 1)
+        if label_line_endpoints:
+            ax.set_ylim(-0.08, 1.08)
+        else:
+            ax.set_ylim(0, 1)
+    elif label_line_endpoints:
+        ylo, yhi = ax.get_ylim()
+        ypad = (yhi - ylo) * 0.12 + 1e-6
+        ax.set_ylim(ylo - ypad, yhi + ypad)
+    if label_line_endpoints:
+        ax.margins(x=0.06)
     ax.grid(True, alpha=0.3)
     if show_legend:
         ax.legend()
-    fig.tight_layout()
-    fig.savefig(save_path, dpi=150)
+    if label_line_endpoints:
+        fig.tight_layout(pad=1.0)
+        fig.savefig(
+            save_path,
+            dpi=150,
+            bbox_inches="tight",
+            pad_inches=0.25,
+        )
+    else:
+        fig.tight_layout()
+        fig.savefig(save_path, dpi=150)
     plt.close(fig)
 
 

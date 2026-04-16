@@ -12,5 +12,4 @@ dependencies = [
     "matplotlib>=3.10.8",
     "polars>=1.38.1",
     "rich>=14.3.3",
-    "plotly>=6.7.0",
 ]

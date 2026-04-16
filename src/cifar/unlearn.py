@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Literal
 
 import matplotlib.pyplot as plt
+import numpy as np
 import polars as pl
 import torch
 import torch.nn as nn
@@ -69,6 +70,16 @@ PER_CLASS_METRIC_COLUMNS: tuple[str, ...] = (
     "loss",
 )
 
+
+def _mean_typicality_per_class_index(safety: CIFAR100Safety, *, num_classes: int) -> np.ndarray:
+    scores = safety.typicality_scores
+    targets = np.asarray(safety.cifar100.base_dataset.targets, dtype=np.int64)
+    sums = np.bincount(targets, weights=scores, minlength=num_classes)
+    counts = np.bincount(targets, minlength=num_classes)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return sums / np.maximum(counts, 1)
+
+
 UnlearningStrategy = Literal["ignore-unknown", "retain-unknown", "forget-unknown"]
 EvalSplit = Literal["train", "test"]
 
@@ -112,6 +123,7 @@ def _experiment_family_tag(dangerous_classes: tuple[str, ...]) -> str:
 def build_unlearn_configs_for_dangerous_grid(
     *,
     dangerous_classes: tuple[str, ...],
+    safe_classes_ordered: tuple[str, ...],
     class_names: tuple[str, ...],
     strategies: tuple[UnlearningStrategy, ...],
     seed: int,
@@ -126,7 +138,12 @@ def build_unlearn_configs_for_dangerous_grid(
         if c not in class_names:
             raise ValueError(f"dangerous class {c!r} is not in this dataset's class list")
 
-    pool_safe = [c for c in class_names if c not in dangerous_set]
+    pool_safe_set = set(class_names) - dangerous_set
+    if set(safe_classes_ordered) != pool_safe_set:
+        raise ValueError("safe_classes_ordered must contain exactly the non-dangerous class names")
+    if len(safe_classes_ordered) != len(pool_safe_set):
+        raise ValueError("safe_classes_ordered must not contain duplicates")
+
     n_dang = len(dangerous_classes)
     num_labels = len(class_names)
     stem = name_prefix if name_prefix is not None else _experiment_family_tag(dangerous_classes)
@@ -138,8 +155,8 @@ def build_unlearn_configs_for_dangerous_grid(
         known_dangerous = set(dangerous_classes[:k])
         target_fraction = k / n_dang
         target_known_total = min(num_labels, round(target_fraction * num_labels))
-        n_safe = max(0, min(len(pool_safe), target_known_total - k))
-        sampled_safe = set(random.sample(pool_safe, n_safe))
+        n_safe = max(0, min(len(safe_classes_ordered), target_known_total - k))
+        sampled_safe = set(safe_classes_ordered[:n_safe])
         known_classes_set = known_dangerous | sampled_safe
         known_classes = tuple(sorted(known_classes_set))
 
@@ -900,12 +917,32 @@ def main(config: UnlearnConfig) -> None:
 
 
 if __name__ == "__main__":
-    dangerous_classes = (
+    data_root = "data"
+    dangerous_classes: set[str] = {
         "forest",
         "willow_tree",
         "maple_tree",
         "oak_tree",
         "pine_tree",
+    }
+
+    cifar100_for_typ = CIFAR100(train=True, root=data_root, transform=None)
+    safety_for_typ = CIFAR100Safety.from_cifar100(
+        cifar100_for_typ,
+        dangerous_classes=dangerous_classes,
+        unknown_classes=frozenset(),
+    )
+    n_cls = len(CIFAR100_CLASSES)
+    mean_typ_idx = _mean_typicality_per_class_index(safety_for_typ, num_classes=n_cls)
+    mean_typ_by_name = {
+        CIFAR100_CLASSES[i]: float(mean_typ_idx[i]) for i in range(n_cls)
+    }
+    dangerous_classes_ordered = tuple(
+        sorted(dangerous_classes, key=lambda c: mean_typ_by_name[c], reverse=True)
+    )
+    safe_classes: set[str] = set(CIFAR100_CLASSES) - dangerous_classes
+    safe_classes_ordered = tuple(
+        sorted(safe_classes, key=lambda c: mean_typ_by_name[c], reverse=True)
     )
 
     strategies: tuple[UnlearningStrategy, ...] = (
@@ -915,7 +952,8 @@ if __name__ == "__main__":
     )
 
     configs = build_unlearn_configs_for_dangerous_grid(
-        dangerous_classes=dangerous_classes,
+        dangerous_classes=dangerous_classes_ordered,
+        safe_classes_ordered=safe_classes_ordered,
         class_names=CIFAR100_CLASSES,
         strategies=strategies,
         seed=42,

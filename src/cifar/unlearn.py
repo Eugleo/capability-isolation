@@ -1,6 +1,6 @@
 import json
 import uuid
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Literal
@@ -18,8 +18,6 @@ from src.cifar.data import (
     CIFAR100,
     CIFAR100_CLASS_TO_INDEX,
     CIFAR100_CLASSES,
-    CIFAR100_FINE_TO_COARSE,
-    CIFAR100_SUPERCLASSES,
     CLASS_TO_INDEX,
     CIFAR10Safety,
     CIFAR100Safety,
@@ -85,12 +83,14 @@ class UnlearnConfig:
     log_every_n_steps: int = 500
 
     data_root: str = "data"
-    dangerous_classes: tuple[str, ...] = ("man", "boy")
-    unknown_classes: tuple[str, ...] = ("girl", "boy")
+    dangerous_classes: tuple[str, ...] = ("tiger", "leopard")
+    unknown_classes: tuple[str, ...] = ("leopard", "bear")
     unlearning_strategy: UnlearningStrategy = "ignore-unknown"
 
     eval_split: EvalSplit = "train"
-    eval_superclass: str | None = "people"
+    eval_class_groups: dict[str, tuple[str, ...]] = field(default_factory=lambda: {
+        "felines": ("tiger", "leopard", "lion")
+    })
 
     pretrained_model_path: str = "checkpoints/cifar100/train_resnet.pt"
     experiments_root: str = "experiments"
@@ -199,8 +199,6 @@ def _build_per_class_rows(
     step: int,
     class_names: tuple[str, ...],
     kind_map: dict[int, SafetyKind],
-    fine_to_coarse: dict[int, int] | None,
-    superclass_names: tuple[str, ...] | None,
 ) -> list[dict]:
     rows: list[dict] = []
     for ci in range(len(class_names)):
@@ -208,7 +206,7 @@ def _build_per_class_rows(
         t1 = int(stats["top1"][ci])
         t5 = int(stats["top5"][ci])
         ls = float(stats["loss"][ci])
-        row: dict = {
+        rows.append({
             "step": step,
             "class_idx": ci,
             "class_name": class_names[ci],
@@ -220,10 +218,7 @@ def _build_per_class_rows(
             "top1_acc": t1 / c if c > 0 else float("nan"),
             "top5_acc": t5 / c if c > 0 else float("nan"),
             "loss": ls / c if c > 0 else float("nan"),
-        }
-        if fine_to_coarse is not None and superclass_names is not None:
-            row["superclass"] = superclass_names[fine_to_coarse[ci]]
-        rows.append(row)
+        })
     return rows
 
 
@@ -274,8 +269,6 @@ def _run_eval(
     class_names: tuple[str, ...],
     kind_map: dict[int, SafetyKind],
     dangerous_idxs: set[int],
-    fine_to_coarse: dict[int, int] | None,
-    superclass_names: tuple[str, ...] | None,
     per_class_rows: list[dict],
 ) -> None:
     stats = _eval_per_class(model, eval_loader, device, num_classes)
@@ -284,8 +277,6 @@ def _run_eval(
         step=step,
         class_names=class_names,
         kind_map=kind_map,
-        fine_to_coarse=fine_to_coarse,
-        superclass_names=superclass_names,
     )
     per_class_rows.extend(rows)
 
@@ -318,6 +309,7 @@ def _plot_lines(
     groups: tuple[str, ...],
     colors: dict[str, str],
     linestyles: dict[str, str],
+    markers: dict[str, str] | None = None,
     metric: str,
     title: str,
     save_path: Path,
@@ -328,14 +320,15 @@ def _plot_lines(
         group_df = df.filter(pl.col(group_col) == group).sort("step")
         if group_df.is_empty():
             continue
+        marker = (markers or {}).get(group, "o")
         ax.plot(
             group_df["step"].to_list(),
             group_df[metric].to_list(),
             label=group,
             color=colors.get(group, "gray"),
             linestyle=linestyles.get(group, "-"),
-            marker="o",
-            markersize=2,
+            marker=marker,
+            markersize=4 if marker == "*" else 2,
             linewidth=1.0,
         )
     ax.set_xlabel("Step")
@@ -440,9 +433,8 @@ def _generate_plots(
     kind_map: dict[int, SafetyKind],
     class_to_idx: dict[str, int],
     out_dir: Path,
-    eval_superclass: str | None,
+    eval_class_groups: dict[str, tuple[str, ...]],
 ) -> None:
-    """Generate all plots from the per-class DataFrame."""
     pc_safety = _add_safety_col(pc_df)
 
     kind_df = _aggregate(pc_df, "kind")
@@ -480,67 +472,72 @@ def _generate_plots(
             save_path=out_dir / f"pareto_{metric}.png",
         )
 
-    if eval_superclass and "superclass" in pc_df.columns:
-        sc_df = pc_df.filter(pl.col("superclass") == eval_superclass)
-        if sc_df.is_empty():
-            return
+    for group_name, group_classes in eval_class_groups.items():
+        group_class_set = set(group_classes)
+        grp_df = pc_df.filter(pl.col("class_name").is_in(group_class_set))
+        if grp_df.is_empty():
+            continue
 
-        sc_dir = out_dir / eval_superclass
-        sc_dir.mkdir(parents=True, exist_ok=True)
+        grp_dir = out_dir / group_name
+        grp_dir.mkdir(parents=True, exist_ok=True)
 
-        sc_safety = _add_safety_col(sc_df)
-        sc_kind_df = _aggregate(sc_df, "kind")
-        sc_safety_df = _aggregate(sc_safety, "safety")
-        sc_class_df = _aggregate(sc_df, "class_name")
+        grp_safety = _add_safety_col(grp_df)
+        grp_kind_df = _aggregate(grp_df, "kind")
+        grp_safety_df = _aggregate(grp_safety, "safety")
+        grp_class_df = _aggregate(grp_df, "class_name")
 
-        sc_class_names = tuple(sorted(sc_df["class_name"].unique().to_list()))
-        sc_colors: dict[str, str] = {}
-        sc_linestyles: dict[str, str] = {}
-        for i, cn in enumerate(sc_class_names):
-            sc_colors[cn] = PER_CLASS_COLORS[i % len(PER_CLASS_COLORS)]
-            sc_linestyles[cn] = "-"
+        grp_class_names = tuple(sorted(grp_df["class_name"].unique().to_list()))
+        grp_colors: dict[str, str] = {}
+        grp_linestyles: dict[str, str] = {}
+        grp_markers: dict[str, str] = {}
+        for i, cn in enumerate(grp_class_names):
+            kind = kind_map[class_to_idx[cn]]
+            grp_colors[cn] = PER_CLASS_COLORS[i % len(PER_CLASS_COLORS)]
+            grp_markers[cn] = "*" if kind in ("k-dang", "u-dang") else "o"
+            grp_linestyles[cn] = "--" if kind in ("u-safe", "u-dang") else "-"
 
         for metric in ("top1_acc", "top5_acc", "loss"):
             display = _METRIC_DISPLAY.get(metric, metric)
 
             _plot_lines(
-                sc_kind_df,
+                grp_kind_df,
                 group_col="kind",
                 groups=ALL_KINDS,
                 colors=GROUP_COLORS,
                 linestyles=GROUP_LINESTYLES,
                 metric=metric,
-                title=f"{eval_superclass}: {display} by Kind",
-                save_path=sc_dir / f"{metric}_by_kind.png",
+                title=f"{group_name}: {display} by Kind",
+                save_path=grp_dir / f"{metric}_by_kind.png",
             )
             _plot_lines(
-                sc_safety_df,
+                grp_safety_df,
                 group_col="safety",
                 groups=("safe", "dangerous"),
                 colors=GROUP_COLORS,
                 linestyles=GROUP_LINESTYLES,
                 metric=metric,
-                title=f"{eval_superclass}: {display}: Safe vs Dangerous",
-                save_path=sc_dir / f"{metric}_safe_vs_dang.png",
+                title=f"{group_name}: {display}: Safe vs Dangerous",
+                save_path=grp_dir / f"{metric}_safe_vs_dang.png",
             )
             _plot_lines(
-                sc_class_df,
+                grp_class_df,
                 group_col="class_name",
-                groups=sc_class_names,
-                colors=sc_colors,
-                linestyles=sc_linestyles,
+                groups=grp_class_names,
+                colors=grp_colors,
+                linestyles=grp_linestyles,
+                markers=grp_markers,
                 metric=metric,
-                title=f"{eval_superclass}: {display} by Class",
-                save_path=sc_dir / f"{metric}_by_class.png",
+                title=f"{group_name}: {display} by Class",
+                save_path=grp_dir / f"{metric}_by_class.png",
             )
 
         for metric in ("top1_acc", "top5_acc"):
             _plot_pareto(
-                sc_safety_df,
+                grp_safety_df,
                 group_col="safety",
                 metric=metric,
-                title_suffix=eval_superclass,
-                save_path=sc_dir / f"pareto_{metric}.png",
+                title_suffix=group_name,
+                save_path=grp_dir / f"pareto_{metric}.png",
             )
 
 
@@ -565,7 +562,7 @@ def main(config: UnlearnConfig) -> None:
     print(f"  unknown_classes: {config.unknown_classes}")
     print(f"  unlearning_strategy: {config.unlearning_strategy}")
     print(f"  eval_split: {config.eval_split}")
-    print(f"  eval_superclass: {config.eval_superclass}")
+    print(f"  eval_class_groups: {config.eval_class_groups}")
 
     retain_kinds, forget_kinds = _strategy_to_kinds(config.unlearning_strategy)
     train_kinds = retain_kinds | forget_kinds
@@ -582,13 +579,9 @@ def main(config: UnlearnConfig) -> None:
     if config.dataset == "cifar100":
         class_names = CIFAR100_CLASSES
         class_to_idx = CIFAR100_CLASS_TO_INDEX
-        fine_to_coarse: dict[int, int] | None = CIFAR100_FINE_TO_COARSE
-        superclass_names: tuple[str, ...] | None = CIFAR100_SUPERCLASSES
     else:
         class_names = CIFAR10_CLASSES
         class_to_idx = CLASS_TO_INDEX
-        fine_to_coarse = None
-        superclass_names = None
 
     num_classes = len(class_names)
     dangerous_idxs = {class_to_idx[c] for c in dangerous_set}
@@ -697,8 +690,6 @@ def main(config: UnlearnConfig) -> None:
         class_names=class_names,
         kind_map=kind_map,
         dangerous_idxs=dangerous_idxs,
-        fine_to_coarse=fine_to_coarse,
-        superclass_names=superclass_names,
         per_class_rows=per_class_rows,
     )
 
@@ -777,7 +768,7 @@ def main(config: UnlearnConfig) -> None:
         kind_map=kind_map,
         class_to_idx=class_to_idx,
         out_dir=experiment_dir,
-        eval_superclass=config.eval_superclass,
+        eval_class_groups=config.eval_class_groups,
     )
 
     model_path = experiment_dir / "unlearned_model.pt"
@@ -799,11 +790,12 @@ if __name__ == "__main__":
     configs: list[UnlearnConfig] = []
     for strategy in strategies:
         tag = strategy.replace("-", "_")
+        name = tag
         configs.append(
             UnlearnConfig(
                 **{
                     **asdict(base_config),
-                    "name": tag,
+                    "name": name,
                     "unlearning_strategy": strategy,
                 }
             )

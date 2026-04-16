@@ -35,6 +35,44 @@ experiment_dirs: list[str] = [
 ]
 
 # %%
+def _load_cifar_unlearn_metrics(exp_path: Path) -> pl.DataFrame:
+    """Return long metrics with columns step, class_name, metric, value."""
+    metrics_path = exp_path / "metrics.csv"
+    if metrics_path.exists():
+        df = pl.read_csv(metrics_path)
+        need = {"step", "class_name", "metric", "value"}
+        if not need.issubset(df.columns):
+            raise ValueError(f"metrics.csv missing columns; need {need}, got {df.columns}")
+        return df
+
+    legacy_wide = exp_path / "per_class_metrics.csv"
+    if legacy_wide.exists():
+        wide = pl.read_csv(legacy_wide)
+        metric_cols = [
+            "count",
+            "top1_correct",
+            "top5_correct",
+            "loss_sum",
+            "top1_acc",
+            "top5_acc",
+            "loss",
+        ]
+        idx = ["step", "class_idx", "class_name"]
+        if not set(idx + metric_cols).issubset(wide.columns):
+            raise ValueError(f"legacy wide CSV missing columns; got {wide.columns}")
+        return wide.unpivot(
+            index=idx,
+            on=metric_cols,
+            variable_name="metric",
+            value_name="value",
+        )
+
+    raise FileNotFoundError(
+        f"No metrics.csv or per_class_metrics.csv under {exp_path}"
+    )
+
+
+# %%
 experiments: list[dict] = []
 
 for exp_path_str in experiment_dirs:
@@ -43,9 +81,7 @@ for exp_path_str in experiment_dirs:
     try:
         with open(exp_path / "config.json") as f:
             config = json.load(f)
-        df = pl.read_csv(exp_path / "cifar_class_metrics.csv")
-        if not {"step", "class", "accuracy"}.issubset(df.columns):
-            raise ValueError(f"Missing expected columns; got {df.columns}")
+        df = _load_cifar_unlearn_metrics(exp_path)
     except Exception as e:
         warnings.warn(f"Skipping {label}: {e}")
         continue
@@ -92,14 +128,19 @@ for i, exp in enumerate(experiments):
     df = exp["df"]
     color = cmap(i % 10)
 
-    steps = sorted(df["step"].unique().to_list())
+    acc = df.filter(pl.col("metric") == "top1_acc")
+    steps = sorted(acc["step"].unique().to_list())
     other_acc_pct: list[float] = []
     forget_quality_pct: list[float] = []
 
     for step in steps:
-        step_df = df.filter(pl.col("step") == step)
-        dang = step_df.filter(pl.col("class").is_in(dangerous_classes))["accuracy"].mean()
-        others = step_df.filter(~pl.col("class").is_in(dangerous_classes))["accuracy"].mean()
+        step_df = acc.filter(pl.col("step") == step)
+        dang = step_df.filter(pl.col("class_name").is_in(dangerous_classes))[
+            "value"
+        ].mean()
+        others = step_df.filter(~pl.col("class_name").is_in(dangerous_classes))[
+            "value"
+        ].mean()
         other_acc_pct.append(float(others) * 100)
         forget_quality_pct.append((1.0 - float(dang)) * 100)
 

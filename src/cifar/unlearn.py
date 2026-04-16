@@ -59,6 +59,16 @@ PER_CLASS_COLORS: tuple[str, ...] = (
     "#17becf",
 )
 
+PER_CLASS_METRIC_COLUMNS: tuple[str, ...] = (
+    "count",
+    "top1_correct",
+    "top5_correct",
+    "loss_sum",
+    "top1_acc",
+    "top5_acc",
+    "loss",
+)
+
 UnlearningStrategy = Literal["ignore-unknown", "retain-unknown", "forget-unknown"]
 EvalSplit = Literal["train", "test"]
 
@@ -305,6 +315,34 @@ def _build_per_class_rows(
             "loss": ls / c if c > 0 else float("nan"),
         })
     return rows
+
+
+def _per_class_wide_to_long(wide: pl.DataFrame) -> pl.DataFrame:
+    return wide.unpivot(
+        index=["step", "class_idx", "class_name"],
+        on=list(PER_CLASS_METRIC_COLUMNS),
+        variable_name="metric",
+        value_name="value",
+    ).sort("step", "class_idx", "metric")
+
+
+def _class_metadata_frame(
+    class_names: tuple[str, ...],
+    kind_map: dict[int, SafetyKind],
+) -> pl.DataFrame:
+    rows: list[dict] = []
+    for ci, name in enumerate(class_names):
+        kind = kind_map[ci]
+        rows.append({
+            "class_idx": ci,
+            "class_name": name,
+            "kind": kind,
+            "is_dangerous": kind in ("k-dang", "u-dang"),
+            "is_known": kind in ("k-safe", "k-dang"),
+            "safety": "dangerous" if kind in ("k-dang", "u-dang") else "safe",
+            "known_unknown": "known" if kind in ("k-safe", "k-dang") else "unknown",
+        })
+    return pl.DataFrame(rows)
 
 
 def _aggregate(df: pl.DataFrame, group_col: str) -> pl.DataFrame:
@@ -841,7 +879,11 @@ def main(config: UnlearnConfig) -> None:
         _run_eval(model, step=global_step, **eval_kwargs)
 
     pc_df = pl.DataFrame(per_class_rows)
-    pc_df.write_csv(experiment_dir / "per_class_metrics.csv")
+    metrics_long = _per_class_wide_to_long(pc_df)
+    metrics_long.write_csv(experiment_dir / "metrics.csv")
+    _class_metadata_frame(class_names, kind_map).write_csv(
+        experiment_dir / "class_metadata.csv"
+    )
 
     _generate_plots(
         pc_df,
@@ -854,14 +896,14 @@ def main(config: UnlearnConfig) -> None:
     model_path = experiment_dir / "unlearned_model.pt"
     torch.save({"model_state_dict": model.state_dict()}, model_path)
 
-    print(f"Saved per-class metrics to {experiment_dir / 'per_class_metrics.csv'}")
+    print(f"Saved metrics to {experiment_dir / 'metrics.csv'}")
+    print(f"Saved class metadata to {experiment_dir / 'class_metadata.csv'}")
     print(f"Saved model to {model_path}")
 
 
 if __name__ == "__main__":
     dangerous_classes = (
         "forest",
-        "palm_tree",
         "willow_tree",
         "maple_tree",
         "oak_tree",

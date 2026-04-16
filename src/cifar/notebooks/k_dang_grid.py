@@ -17,10 +17,12 @@ cifar100_train = CIFAR100(
     root=cfg.data_root,
     transform=get_eval_transform(),
 )
+known = set(cfg.known_classes) if cfg.known_classes else set(CIFAR100_CLASSES)
+unknown = set(CIFAR100_CLASSES) - known
 safety: CIFAR100Safety = CIFAR100Safety.from_cifar100(
     cifar100_train,
     dangerous_classes=set(cfg.dangerous_classes),
-    unknown_classes=set(cfg.unknown_classes),
+    unknown_classes=unknown,
 )
 
 # %%
@@ -33,7 +35,7 @@ kdang_idx = kdang_idx[order]
 n = len(kdang_idx)
 print(
     f"CIFAR100Safety: dangerous={cfg.dangerous_classes!r}, "
-    f"unknown={cfg.unknown_classes!r}, seed={cfg.seed}"
+    f"known={sorted(known)!r}, seed={cfg.seed}"
 )
 print(f"k-dang count: {n}")
 

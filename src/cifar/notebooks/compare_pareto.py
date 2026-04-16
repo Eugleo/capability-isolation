@@ -65,10 +65,20 @@ if len(experiments) >= 2:
                 f"dangerous_classes mismatch: {exp['label']} has "
                 f"'{cfg.get('dangerous_classes')}' vs reference '{ref.get('dangerous_classes')}'"
             )
-        if cfg.get("unknown_classes") != ref.get("unknown_classes"):
+        mask_key = (
+            ("known", tuple(cfg.get("known_classes", [])))
+            if "known_classes" in cfg
+            else ("unknown", tuple(cfg.get("unknown_classes", [])))
+        )
+        ref_mask_key = (
+            ("known", tuple(ref.get("known_classes", [])))
+            if "known_classes" in ref
+            else ("unknown", tuple(ref.get("unknown_classes", [])))
+        )
+        if mask_key != ref_mask_key:
             warnings.warn(
-                f"unknown_classes mismatch: {exp['label']} has "
-                f"'{cfg.get('unknown_classes')}' vs reference '{ref.get('unknown_classes')}'"
+                f"known/unknown class mask mismatch: {exp['label']} has "
+                f"{mask_key!r} vs reference {ref_mask_key!r}"
             )
 
 # %%

@@ -84,8 +84,9 @@ class UnlearnConfig:
     log_every_n_steps: int = 1000
 
     data_root: str = "data"
-    dangerous_classes: tuple[str, ...] = ("willow_tree", "maple_tree", "oak_tree", "pine_tree")
-    unknown_classes: tuple[str, ...] = ()
+    dangerous_classes: tuple[str, ...] = ("forest", "palm_tree", "willow_tree", "maple_tree", "oak_tree", "pine_tree")
+    # Empty tuple means every class is known (matches former default of unknown_classes=()).
+    known_classes: tuple[str, ...] = ()
     unlearning_strategy: UnlearningStrategy = "ignore-unknown"
 
     eval_split: EvalSplit = "train"
@@ -93,6 +94,84 @@ class UnlearnConfig:
 
     pretrained_model_path: str = "checkpoints/cifar100/train_resnet.pt"
     experiments_root: str = "experiments"
+
+
+def _experiment_family_tag(dangerous_classes: tuple[str, ...]) -> str:
+    if not dangerous_classes:
+        return "exp"
+    tails = {c.rsplit("_", 1)[-1] for c in dangerous_classes}
+    if len(tails) == 1:
+        return next(iter(tails))
+    return f"{len(dangerous_classes)}dang"
+
+
+def build_unlearn_configs_for_dangerous_grid(
+    *,
+    dangerous_classes: tuple[str, ...],
+    class_names: tuple[str, ...],
+    strategies: tuple[UnlearningStrategy, ...],
+    seed: int,
+    name_prefix: str | None = None,
+) -> list[UnlearnConfig]:
+    if not dangerous_classes:
+        raise ValueError("dangerous_classes must be non-empty")
+    dangerous_set = set(dangerous_classes)
+    if len(dangerous_set) != len(dangerous_classes):
+        raise ValueError("dangerous_classes must not contain duplicates")
+    for c in dangerous_classes:
+        if c not in class_names:
+            raise ValueError(f"dangerous class {c!r} is not in this dataset's class list")
+
+    pool_safe = [c for c in class_names if c not in dangerous_set]
+    n_dang = len(dangerous_classes)
+    num_labels = len(class_names)
+    stem = name_prefix if name_prefix is not None else _experiment_family_tag(dangerous_classes)
+
+    configs: list[UnlearnConfig] = []
+    ks = [1] if n_dang == 1 else list(range(1, n_dang))
+    for k in ks:
+        set_seed(seed)
+        known_dangerous = set(dangerous_classes[:k])
+        target_fraction = k / n_dang
+        target_known_total = min(num_labels, round(target_fraction * num_labels))
+        n_safe = max(0, min(len(pool_safe), target_known_total - k))
+        sampled_safe = set(random.sample(pool_safe, n_safe))
+        known_classes_set = known_dangerous | sampled_safe
+        known_classes = tuple(sorted(known_classes_set))
+
+        unknown_names = set(class_names) - known_classes_set
+        unknown_safe = [c for c in unknown_names if c not in dangerous_set]
+        known_safe = sorted(known_classes_set - dangerous_set)
+
+        n_u = min(3, len(unknown_safe))
+        n_k = min(3, len(known_safe))
+        subsample_classes = (
+            list(dangerous_classes)
+            + random.sample(unknown_safe, n_u)
+            + random.sample(known_safe, n_k)
+        )
+
+        pct_tag = int(round(100 * k / n_dang))
+        eval_class_groups: dict[str, tuple[str, ...]] = {
+            "all": class_names,
+            "unknown": tuple(sorted(dangerous_set | unknown_names)),
+            "subsample": tuple(sorted(subsample_classes)),
+        }
+
+        for strategy in strategies:
+            tag = strategy.replace("-", "_")
+            name = f"{stem}_{pct_tag}p_{tag}"
+            configs.append(
+                UnlearnConfig(
+                    name=name,
+                    dangerous_classes=dangerous_classes,
+                    known_classes=known_classes,
+                    unlearning_strategy=strategy,
+                    eval_class_groups=eval_class_groups,
+                )
+            )
+
+    return configs
 
 
 def _create_experiment_dir(root: str, *, name: str | None = None) -> Path:
@@ -136,10 +215,10 @@ def _class_to_kind(
     class_idx: int,
     *,
     dangerous_idxs: set[int],
-    unknown_idxs: set[int],
+    known_idxs: set[int],
 ) -> SafetyKind:
     is_dangerous = class_idx in dangerous_idxs
-    is_known = class_idx not in unknown_idxs
+    is_known = class_idx in known_idxs
     if is_known and not is_dangerous:
         return "k-safe"
     if is_known and is_dangerous:
@@ -571,7 +650,7 @@ def main(config: UnlearnConfig) -> None:
     print(f"  batch_size: {config.batch_size}")
     print(f"  eval_every_n_steps: {config.eval_every_n_steps}")
     print(f"  dangerous_classes: {config.dangerous_classes}")
-    print(f"  unknown_classes: {config.unknown_classes}")
+    print(f"  known_classes: {config.known_classes}")
     print(f"  unlearning_strategy: {config.unlearning_strategy}")
     print(f"  eval_split: {config.eval_split}")
     print(f"  eval_class_groups: {config.eval_class_groups}")
@@ -585,7 +664,6 @@ def main(config: UnlearnConfig) -> None:
     print(f"Experiment dir: {experiment_dir}")
 
     dangerous_set = set(config.dangerous_classes)
-    unknown_set = set(config.unknown_classes)
     eval_transform = get_eval_transform()
 
     if config.dataset == "cifar100":
@@ -596,10 +674,16 @@ def main(config: UnlearnConfig) -> None:
         class_to_idx = CLASS_TO_INDEX
 
     num_classes = len(class_names)
+    if len(config.known_classes) == 0:
+        known_set = set(class_names)
+    else:
+        known_set = set(config.known_classes)
+
     dangerous_idxs = {class_to_idx[c] for c in dangerous_set}
-    unknown_idxs = {class_to_idx[c] for c in unknown_set}
+    unknown_set = set(class_names) - known_set
+    known_idxs = {class_to_idx[c] for c in known_set}
     kind_map = {
-        ci: _class_to_kind(ci, dangerous_idxs=dangerous_idxs, unknown_idxs=unknown_idxs)
+        ci: _class_to_kind(ci, dangerous_idxs=dangerous_idxs, known_idxs=known_idxs)
         for ci in range(num_classes)
     }
 
@@ -790,138 +874,29 @@ def main(config: UnlearnConfig) -> None:
     print(f"Saved model to {model_path}")
 
 
-# if __name__ == "__main__":
-#     dangerous_classes = ("lion", "tiger", "leopard")
-#     dangerous_set = set(dangerous_classes)
-#
-#     experiment_setups: list[dict] = [
-#         {
-#             "tag": "33p",
-#             "known_dangerous": {"tiger"},
-#             "n_safe": 32,
-#         },
-#         {
-#             "tag": "66p",
-#             "known_dangerous": {"tiger", "lion"},
-#             "n_safe": 64,
-#         },
-#     ]
-#
-#     strategies: list[UnlearningStrategy] = [
-#         "ignore-unknown",
-#         "forget-unknown",
-#         "retain-unknown",
-#     ]
-#
-#     configs: list[UnlearnConfig] = []
-#
-#     for setup in experiment_setups:
-#         set_seed(42)
-#         pool = [c for c in CIFAR100_CLASSES if c not in dangerous_set]
-#         sampled_safe = set(random.sample(pool, setup["n_safe"]))
-#         known_classes = setup["known_dangerous"] | sampled_safe
-#         unknown_classes = tuple(c for c in CIFAR100_CLASSES if c not in known_classes)
-#
-#         unknown_safe = [c for c in unknown_classes if c not in dangerous_set]
-#         known_safe = sorted(sampled_safe - dangerous_set)
-#
-#         subsample_classes = (
-#             list(dangerous_classes)
-#             + random.sample(unknown_safe, 3)
-#             + random.sample(known_safe, 3)
-#         )
-#
-#         eval_class_groups: dict[str, tuple[str, ...]] = {
-#             "all": CIFAR100_CLASSES,
-#             "unknown": tuple(sorted(dangerous_set | set(unknown_classes))),
-#             "subsample": tuple(sorted(subsample_classes)),
-#         }
-#
-#         for strategy in strategies:
-#             tag = strategy.replace("-", "_")
-#             name = f"feline_{setup['tag']}_{tag}"
-#             configs.append(
-#                 UnlearnConfig(
-#                     name=name,
-#                     dangerous_classes=dangerous_classes,
-#                     unknown_classes=unknown_classes,
-#                     unlearning_strategy=strategy,
-#                     eval_class_groups=eval_class_groups,
-#                 )
-#             )
-#
-#     print(f"Running {len(configs)} experiments")
-#     for i, config in enumerate(configs, 1):
-#         print(f"\n{'=' * 60}")
-#         print(f"[{i}/{len(configs)}] {config.name}")
-#         print(f"{'=' * 60}")
-#         main(config)
-
-
 if __name__ == "__main__":
-    dangerous_classes = ("willow_tree", "maple_tree", "oak_tree", "pine_tree")
-    dangerous_set = set(dangerous_classes)
+    dangerous_classes = (
+        "forest",
+        "palm_tree",
+        "willow_tree",
+        "maple_tree",
+        "oak_tree",
+        "pine_tree",
+    )
 
-    experiment_setups: list[dict] = [
-        {
-            "tag": "25p",
-            "known_dangerous": {"willow_tree"},
-            "n_safe": 24,
-        },
-        {
-            "tag": "50p",
-            "known_dangerous": {"willow_tree", "maple_tree"},
-            "n_safe": 48,
-        },
-        {
-            "tag": "75p",
-            "known_dangerous": {"willow_tree", "maple_tree", "oak_tree"},
-            "n_safe": 72,
-        },
-    ]
-
-    strategies: list[UnlearningStrategy] = [
+    strategies: tuple[UnlearningStrategy, ...] = (
         "ignore-unknown",
         "forget-unknown",
         "retain-unknown",
-    ]
+    )
 
-    configs: list[UnlearnConfig] = []
-
-    for setup in experiment_setups:
-        set_seed(42)
-        pool = [c for c in CIFAR100_CLASSES if c not in dangerous_set]
-        sampled_safe = set(random.sample(pool, setup["n_safe"]))
-        known_classes = setup["known_dangerous"] | sampled_safe
-        unknown_classes = tuple(c for c in CIFAR100_CLASSES if c not in known_classes)
-
-        unknown_safe = [c for c in unknown_classes if c not in dangerous_set]
-        known_safe = sorted(sampled_safe - dangerous_set)
-
-        subsample_classes = (
-            list(dangerous_classes)
-            + random.sample(unknown_safe, 3)
-            + random.sample(known_safe, 3)
-        )
-
-        eval_class_groups: dict[str, tuple[str, ...]] = {
-            "all": CIFAR100_CLASSES,
-            "unknown": tuple(sorted(dangerous_set | set(unknown_classes))),
-            "subsample": tuple(sorted(subsample_classes)),
-        }
-
-        for strategy in strategies:
-            tag = strategy.replace("-", "_")
-            name = f"tree_{setup['tag']}_{tag}"
-            configs.append(
-                UnlearnConfig(
-                    name=name,
-                    dangerous_classes=dangerous_classes,
-                    unknown_classes=unknown_classes,
-                    unlearning_strategy=strategy,
-                    eval_class_groups=eval_class_groups,
-                )
-            )
+    configs = build_unlearn_configs_for_dangerous_grid(
+        dangerous_classes=dangerous_classes,
+        class_names=CIFAR100_CLASSES,
+        strategies=strategies,
+        seed=42,
+        name_prefix="tree",
+    )
 
     print(f"Running {len(configs)} experiments")
     for i, config in enumerate(configs, 1):

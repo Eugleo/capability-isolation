@@ -6,7 +6,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Literal
 
-import matplotlib.pyplot as plt
+import plotly.graph_objects as go
 import polars as pl
 import torch
 import torch.nn as nn
@@ -84,7 +84,7 @@ class UnlearnConfig:
     log_every_n_steps: int = 1000
 
     data_root: str = "data"
-    dangerous_classes: tuple[str, ...] = ("lion", "tiger", "leopard")
+    dangerous_classes: tuple[str, ...] = ("willow_tree", "maple_tree", "oak_tree", "pine_tree")
     unknown_classes: tuple[str, ...] = ()
     unlearning_strategy: UnlearningStrategy = "ignore-unknown"
 
@@ -301,6 +301,19 @@ _METRIC_DISPLAY: dict[str, str] = {
 }
 
 
+_PLOTLY_DASH_MAP: dict[str, str] = {
+    "-": "solid",
+    "--": "dash",
+    "-.": "dashdot",
+    ":": "dot",
+}
+
+_PLOTLY_SYMBOL_MAP: dict[str, str] = {
+    "o": "circle",
+    "*": "star",
+}
+
+
 def _plot_lines(
     df: pl.DataFrame,
     *,
@@ -314,32 +327,36 @@ def _plot_lines(
     save_path: Path,
 ) -> None:
     display = _METRIC_DISPLAY.get(metric, metric)
-    fig, ax = plt.subplots(figsize=(10, 6))
+    fig = go.Figure()
     for group in groups:
         group_df = df.filter(pl.col(group_col) == group).sort("step")
         if group_df.is_empty():
             continue
-        marker = (markers or {}).get(group, "o")
-        ax.plot(
-            group_df["step"].to_list(),
-            group_df[metric].to_list(),
-            label=group,
-            color=colors.get(group, "gray"),
-            linestyle=linestyles.get(group, "-"),
-            marker=marker,
-            markersize=12 if marker == "*" else 6,
-            linewidth=1.0,
-        )
-    ax.set_xlabel("Step")
-    ax.set_ylabel(display)
-    ax.set_title(title)
-    if metric in ("top1_acc", "top5_acc"):
-        ax.set_ylim(0, 1)
-    ax.grid(True, alpha=0.3)
-    ax.legend()
-    fig.tight_layout()
-    fig.savefig(save_path, dpi=150)
-    plt.close(fig)
+        marker_char = (markers or {}).get(group, "o")
+        fig.add_trace(go.Scatter(
+            x=group_df["step"].to_list(),
+            y=group_df[metric].to_list(),
+            mode="lines+markers",
+            name=group,
+            line=dict(
+                color=colors.get(group, "gray"),
+                dash=_PLOTLY_DASH_MAP.get(linestyles.get(group, "-"), "solid"),
+                width=1.5,
+            ),
+            marker=dict(
+                symbol=_PLOTLY_SYMBOL_MAP.get(marker_char, "circle"),
+                size=12 if marker_char == "*" else 6,
+            ),
+        ))
+    y_range = [0, 1] if metric in ("top1_acc", "top5_acc") else None
+    fig.update_layout(
+        title=title,
+        xaxis_title="Step",
+        yaxis_title=display,
+        yaxis_range=y_range,
+        template="plotly_white",
+    )
+    fig.write_html(save_path)
 
 
 def _plot_pareto(
@@ -350,15 +367,13 @@ def _plot_pareto(
     title_suffix: str = "",
     save_path: Path,
 ) -> None:
-    import matplotlib.colors as mcolors
-    from matplotlib.colors import LinearSegmentedColormap
-
     display = _METRIC_DISPLAY.get(metric, metric)
     is_acc = metric.endswith("_acc")
 
     steps = sorted(df["step"].unique().to_list())
     retain_vals: list[float] = []
     forget_vals: list[float] = []
+    valid_steps: list[int] = []
 
     for step in steps:
         step_df = df.filter(pl.col("step") == step)
@@ -375,55 +390,51 @@ def _plot_pareto(
         else:
             retain_vals.append(safe_val)
             forget_vals.append(dang_val)
+        valid_steps.append(step)
 
     if not retain_vals:
         return
 
-    norm = mcolors.Normalize(vmin=min(steps), vmax=max(steps))
-    cmap = LinearSegmentedColormap.from_list("blues", ["#b3d4fc", "#08306b"])
-
-    fig, ax = plt.subplots(figsize=(7, 7))
-
-    for i in range(len(steps) - 1):
-        ax.plot(
-            retain_vals[i : i + 2],
-            forget_vals[i : i + 2],
-            color=cmap(norm(steps[i])),
-            linewidth=1.5,
-            zorder=1,
-        )
-
-    sc = ax.scatter(
-        retain_vals,
-        forget_vals,
-        c=steps[: len(retain_vals)],
-        cmap=cmap,
-        norm=norm,
-        s=50,
-        edgecolors="white",
-        linewidths=0.5,
-        zorder=2,
-    )
-    cbar = fig.colorbar(sc, ax=ax, pad=0.02)
-    cbar.set_label("Step", fontsize=11)
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=retain_vals,
+        y=forget_vals,
+        mode="lines+markers",
+        marker=dict(
+            size=8,
+            color=valid_steps,
+            colorscale=[[0, "#b3d4fc"], [1, "#08306b"]],
+            colorbar=dict(title="Step"),
+            line=dict(color="white", width=0.5),
+        ),
+        line=dict(color="rgba(100,100,100,0.4)", width=1.5),
+        text=[f"step {s}" for s in valid_steps],
+        hovertemplate="%{text}<br>x=%{x:.1f}<br>y=%{y:.1f}<extra></extra>",
+    ))
 
     if is_acc:
-        ax.set_xlabel(f"Safe {display} (%) \u2191", fontsize=12)
-        ax.set_ylabel(f"1 \u2212 Dangerous {display} (%) \u2191", fontsize=12)
-        ax.set_xlim(0, 100)
-        ax.set_ylim(0, 100)
+        x_label = f"Safe {display} (%) \u2191"
+        y_label = f"1 \u2212 Dangerous {display} (%) \u2191"
+        x_range = [0, 100]
+        y_range = [0, 100]
     else:
-        ax.set_xlabel(f"Safe {display} \u2193", fontsize=12)
-        ax.set_ylabel(f"Dangerous {display} \u2191", fontsize=12)
+        x_label = f"Safe {display} \u2193"
+        y_label = f"Dangerous {display} \u2191"
+        x_range = None
+        y_range = None
 
     title = f"Pareto ({display}): Safe vs Dangerous"
     if title_suffix:
         title += f" [{title_suffix}]"
-    ax.set_title(title, fontsize=13)
-    ax.grid(True, alpha=0.25)
-    fig.tight_layout()
-    fig.savefig(save_path, dpi=150)
-    plt.close(fig)
+    fig.update_layout(
+        title=title,
+        xaxis_title=x_label,
+        yaxis_title=y_label,
+        xaxis_range=x_range,
+        yaxis_range=y_range,
+        template="plotly_white",
+    )
+    fig.write_html(save_path)
 
 
 def _generate_plots(
@@ -434,46 +445,6 @@ def _generate_plots(
     out_dir: Path,
     eval_class_groups: dict[str, tuple[str, ...]],
 ) -> None:
-    pc_safety = _add_safety_col(pc_df)
-
-    kind_df = _aggregate(pc_df, "kind")
-    safety_df = _aggregate(pc_safety, "safety")
-
-    all_dir = out_dir / "all"
-    all_dir.mkdir(parents=True, exist_ok=True)
-
-    for metric in ("top1_acc", "top5_acc", "loss"):
-        display = _METRIC_DISPLAY.get(metric, metric)
-
-        _plot_lines(
-            kind_df,
-            group_col="kind",
-            groups=ALL_KINDS,
-            colors=GROUP_COLORS,
-            linestyles=GROUP_LINESTYLES,
-            metric=metric,
-            title=f"{display} by Kind",
-            save_path=all_dir / f"{metric}_by_kind.png",
-        )
-        _plot_lines(
-            safety_df,
-            group_col="safety",
-            groups=("safe", "dangerous"),
-            colors=GROUP_COLORS,
-            linestyles=GROUP_LINESTYLES,
-            metric=metric,
-            title=f"{display}: Safe vs Dangerous",
-            save_path=all_dir / f"{metric}_safe_vs_dang.png",
-        )
-
-    for metric in ("top1_acc", "top5_acc"):
-        _plot_pareto(
-            safety_df,
-            group_col="safety",
-            metric=metric,
-            save_path=all_dir / f"pareto_{metric}.png",
-        )
-
     for group_name, group_classes in eval_class_groups.items():
         group_class_set = set(group_classes)
         grp_df = pc_df.filter(pl.col("class_name").is_in(group_class_set))
@@ -509,7 +480,7 @@ def _generate_plots(
                 linestyles=GROUP_LINESTYLES,
                 metric=metric,
                 title=f"{group_name}: {display} by Kind",
-                save_path=grp_dir / f"{metric}_by_kind.png",
+                save_path=grp_dir / f"{metric}_by_kind.html",
             )
             _plot_lines(
                 grp_safety_df,
@@ -519,7 +490,7 @@ def _generate_plots(
                 linestyles=GROUP_LINESTYLES,
                 metric=metric,
                 title=f"{group_name}: {display}: Safe vs Dangerous",
-                save_path=grp_dir / f"{metric}_safe_vs_dang.png",
+                save_path=grp_dir / f"{metric}_safe_vs_dang.html",
             )
             _plot_lines(
                 grp_class_df,
@@ -530,7 +501,7 @@ def _generate_plots(
                 markers=grp_markers,
                 metric=metric,
                 title=f"{group_name}: {display} by Class",
-                save_path=grp_dir / f"{metric}_by_class.png",
+                save_path=grp_dir / f"{metric}_by_class.html",
             )
 
         for metric in ("top1_acc", "top5_acc"):
@@ -539,7 +510,7 @@ def _generate_plots(
                 group_col="safety",
                 metric=metric,
                 title_suffix=group_name,
-                save_path=grp_dir / f"pareto_{metric}.png",
+                save_path=grp_dir / f"pareto_{metric}.html",
             )
 
 
@@ -781,19 +752,24 @@ def main(config: UnlearnConfig) -> None:
 
 
 if __name__ == "__main__":
-    dangerous_classes = ("lion", "tiger", "leopard")
+    dangerous_classes = ("willow_tree", "maple_tree", "oak_tree", "pine_tree")
     dangerous_set = set(dangerous_classes)
 
     experiment_setups: list[dict] = [
         {
-            "tag": "33p",
-            "known_dangerous": {"tiger"},
-            "n_safe": 32,
+            "tag": "25p",
+            "known_dangerous": {"willow_tree"},
+            "n_safe": 24,
         },
         {
-            "tag": "66p",
-            "known_dangerous": {"tiger", "lion"},
-            "n_safe": 64,
+            "tag": "50p",
+            "known_dangerous": {"willow_tree", "maple_tree"},
+            "n_safe": 48,
+        },
+        {
+            "tag": "75p",
+            "known_dangerous": {"willow_tree", "maple_tree", "oak_tree"},
+            "n_safe": 72,
         },
     ]
 
@@ -821,14 +797,15 @@ if __name__ == "__main__":
             + random.sample(known_safe, 3)
         )
 
-        eval_class_groups = {
+        eval_class_groups: dict[str, tuple[str, ...]] = {
+            "all": CIFAR100_CLASSES,
             "unknown": tuple(sorted(dangerous_set | set(unknown_classes))),
             "subsample": tuple(sorted(subsample_classes)),
         }
 
         for strategy in strategies:
             tag = strategy.replace("-", "_")
-            name = f"feline_{setup['tag']}_{tag}"
+            name = f"tree_{setup['tag']}_{tag}"
             configs.append(
                 UnlearnConfig(
                     name=name,

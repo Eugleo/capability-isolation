@@ -1,4 +1,5 @@
 import json
+import random
 import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
@@ -79,18 +80,16 @@ class UnlearnConfig:
     neggrad_forget_weight: float = 5e-5
     max_grad_norm: float = 1.0
     batch_size: int = 128
-    eval_every_n_steps: int = 100
-    log_every_n_steps: int = 500
+    eval_every_n_steps: int = 200
+    log_every_n_steps: int = 1000
 
     data_root: str = "data"
-    dangerous_classes: tuple[str, ...] = ("tiger", "leopard")
-    unknown_classes: tuple[str, ...] = ("leopard", "bear")
+    dangerous_classes: tuple[str, ...] = ("lion", "tiger", "leopard")
+    unknown_classes: tuple[str, ...] = ()
     unlearning_strategy: UnlearningStrategy = "ignore-unknown"
 
     eval_split: EvalSplit = "train"
-    eval_class_groups: dict[str, tuple[str, ...]] = field(default_factory=lambda: {
-        "felines": ("tiger", "leopard", "lion")
-    })
+    eval_class_groups: dict[str, tuple[str, ...]] = field(default_factory=dict)
 
     pretrained_model_path: str = "checkpoints/cifar100/train_resnet.pt"
     experiments_root: str = "experiments"
@@ -328,7 +327,7 @@ def _plot_lines(
             color=colors.get(group, "gray"),
             linestyle=linestyles.get(group, "-"),
             marker=marker,
-            markersize=4 if marker == "*" else 2,
+            markersize=12 if marker == "*" else 6,
             linewidth=1.0,
         )
     ax.set_xlabel("Step")
@@ -440,6 +439,9 @@ def _generate_plots(
     kind_df = _aggregate(pc_df, "kind")
     safety_df = _aggregate(pc_safety, "safety")
 
+    all_dir = out_dir / "all"
+    all_dir.mkdir(parents=True, exist_ok=True)
+
     for metric in ("top1_acc", "top5_acc", "loss"):
         display = _METRIC_DISPLAY.get(metric, metric)
 
@@ -451,7 +453,7 @@ def _generate_plots(
             linestyles=GROUP_LINESTYLES,
             metric=metric,
             title=f"{display} by Kind",
-            save_path=out_dir / f"{metric}_by_kind.png",
+            save_path=all_dir / f"{metric}_by_kind.png",
         )
         _plot_lines(
             safety_df,
@@ -461,7 +463,7 @@ def _generate_plots(
             linestyles=GROUP_LINESTYLES,
             metric=metric,
             title=f"{display}: Safe vs Dangerous",
-            save_path=out_dir / f"{metric}_safe_vs_dang.png",
+            save_path=all_dir / f"{metric}_safe_vs_dang.png",
         )
 
     for metric in ("top1_acc", "top5_acc"):
@@ -469,7 +471,7 @@ def _generate_plots(
             safety_df,
             group_col="safety",
             metric=metric,
-            save_path=out_dir / f"pareto_{metric}.png",
+            save_path=all_dir / f"pareto_{metric}.png",
         )
 
     for group_name, group_classes in eval_class_groups.items():
@@ -779,7 +781,21 @@ def main(config: UnlearnConfig) -> None:
 
 
 if __name__ == "__main__":
-    base_config = UnlearnConfig()
+    dangerous_classes = ("lion", "tiger", "leopard")
+    dangerous_set = set(dangerous_classes)
+
+    experiment_setups: list[dict] = [
+        {
+            "tag": "33p",
+            "known_dangerous": {"tiger"},
+            "n_safe": 32,
+        },
+        {
+            "tag": "66p",
+            "known_dangerous": {"tiger", "lion"},
+            "n_safe": 64,
+        },
+    ]
 
     strategies: list[UnlearningStrategy] = [
         "ignore-unknown",
@@ -788,18 +804,40 @@ if __name__ == "__main__":
     ]
 
     configs: list[UnlearnConfig] = []
-    for strategy in strategies:
-        tag = strategy.replace("-", "_")
-        name = tag
-        configs.append(
-            UnlearnConfig(
-                **{
-                    **asdict(base_config),
-                    "name": name,
-                    "unlearning_strategy": strategy,
-                }
-            )
+
+    for setup in experiment_setups:
+        set_seed(42)
+        pool = [c for c in CIFAR100_CLASSES if c not in dangerous_set]
+        sampled_safe = set(random.sample(pool, setup["n_safe"]))
+        known_classes = setup["known_dangerous"] | sampled_safe
+        unknown_classes = tuple(c for c in CIFAR100_CLASSES if c not in known_classes)
+
+        unknown_safe = [c for c in unknown_classes if c not in dangerous_set]
+        known_safe = sorted(sampled_safe - dangerous_set)
+
+        subsample_classes = (
+            list(dangerous_classes)
+            + random.sample(unknown_safe, 3)
+            + random.sample(known_safe, 3)
         )
+
+        eval_class_groups = {
+            "unknown": tuple(sorted(dangerous_set | set(unknown_classes))),
+            "subsample": tuple(sorted(subsample_classes)),
+        }
+
+        for strategy in strategies:
+            tag = strategy.replace("-", "_")
+            name = f"feline_{setup['tag']}_{tag}"
+            configs.append(
+                UnlearnConfig(
+                    name=name,
+                    dangerous_classes=dangerous_classes,
+                    unknown_classes=unknown_classes,
+                    unlearning_strategy=strategy,
+                    eval_class_groups=eval_class_groups,
+                )
+            )
 
     print(f"Running {len(configs)} experiments")
     for i, config in enumerate(configs, 1):

@@ -150,33 +150,33 @@ def build_unlearn_configs_for_dangerous_grid(
 
     configs: list[UnlearnConfig] = []
     ks = [1] if n_dang == 1 else list(range(1, n_dang))
-    for k in ks:
-        set_seed(seed)
-        known_dangerous = set(dangerous_classes[:k])
-        target_fraction = k / n_dang
-        target_known_total = min(num_labels, round(target_fraction * num_labels))
-        n_safe = max(0, min(len(safe_classes_ordered), target_known_total - k))
-        sampled_safe = set(safe_classes_ordered[:n_safe])
-        known_classes_set = known_dangerous | sampled_safe
-        known_classes = tuple(sorted(known_classes_set))
+    for strategy in strategies:
+        for k in ks:
+            set_seed(seed)
+            known_dangerous = set(dangerous_classes[:k])
+            target_fraction = k / n_dang
+            target_known_total = min(num_labels, round(target_fraction * num_labels))
+            n_safe = max(0, min(len(safe_classes_ordered), target_known_total - k))
+            sampled_safe = set(safe_classes_ordered[:n_safe])
+            known_classes_set = known_dangerous | sampled_safe
+            known_classes = tuple(sorted(known_classes_set))
 
-        unknown_names = set(class_names) - known_classes_set
-        unknown_safe = sorted(unknown_names - dangerous_set)
-        known_safe = sorted(known_classes_set - dangerous_set)
+            unknown_names = set(class_names) - known_classes_set
+            unknown_safe = sorted(unknown_names - dangerous_set)
+            known_safe = sorted(known_classes_set - dangerous_set)
 
-        n_k_safe = min(5, len(known_safe))
-        n_u_safe = min(5, len(unknown_safe))
-        subsampled_classes = list(dangerous_classes)
-        subsampled_classes.extend(random.sample(known_safe, n_k_safe))
-        subsampled_classes.extend(random.sample(unknown_safe, n_u_safe))
+            n_k_safe = min(5, len(known_safe))
+            n_u_safe = min(5, len(unknown_safe))
+            subsampled_classes = list(dangerous_classes)
+            subsampled_classes.extend(random.sample(known_safe, n_k_safe))
+            subsampled_classes.extend(random.sample(unknown_safe, n_u_safe))
 
-        pct_tag = int(round(100 * k / n_dang))
-        eval_class_groups: dict[str, tuple[str, ...]] = {
-            "all": class_names,
-            "subsampled": tuple(sorted(subsampled_classes)),
-        }
+            pct_tag = int(round(100 * k / n_dang))
+            eval_class_groups: dict[str, tuple[str, ...]] = {
+                "all": class_names,
+                "subsampled": tuple(sorted(subsampled_classes)),
+            }
 
-        for strategy in strategies:
             tag = strategy.replace("-", "_")
             name = f"{stem}_{pct_tag}p_{tag}"
             configs.append(

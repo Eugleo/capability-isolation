@@ -24,18 +24,12 @@ from src.cifar.data import (
     CIFAR100Safety,
     SafetyKind,
 )
-from src.cifar.train_resnet import (
-    CIFAR_NUM_CLASSES,
-    CifarVariant,
-    build_cifar_resnet18,
-    get_eval_transform,
-)
+from src.cifar.train_resnet import CifarVariant, build_cifar_resnet18, get_eval_transform
 from src.utils import get_device, set_seed
 
 SafetyDataset = CIFAR10Safety | CIFAR100Safety
 
 ALL_KINDS: tuple[SafetyKind, ...] = ("k-safe", "k-dang", "u-safe", "u-dang")
-KIND_TO_IDX: dict[str, int] = {k: i for i, k in enumerate(ALL_KINDS)}
 GROUP_COLORS: dict[str, str] = {
     "k-dang": "red",
     "u-dang": "orange",
@@ -140,7 +134,7 @@ def build_unlearn_configs_for_dangerous_grid(
         known_classes = tuple(sorted(known_classes_set))
 
         unknown_names = set(class_names) - known_classes_set
-        unknown_safe = [c for c in unknown_names if c not in dangerous_set]
+        unknown_safe = sorted(unknown_names - dangerous_set)
         known_safe = sorted(known_classes_set - dangerous_set)
 
         n_u = min(3, len(unknown_safe))
@@ -190,14 +184,38 @@ def _create_experiment_dir(root: str, *, name: str | None = None) -> Path:
 def _strategy_to_kinds(
     strategy: UnlearningStrategy,
 ) -> tuple[set[SafetyKind], set[SafetyKind]]:
-    """Returns (retain_kinds, forget_kinds) for the given strategy."""
     retain: set[SafetyKind] = {"k-safe"}
     forget: set[SafetyKind] = {"k-dang"}
+    extra_unknown: set[SafetyKind] = {"u-safe", "u-dang"}
     if strategy == "retain-unknown":
-        retain |= {"u-safe", "u-dang"}
+        retain |= extra_unknown
     elif strategy == "forget-unknown":
-        forget |= {"u-safe", "u-dang"}
+        forget |= extra_unknown
     return retain, forget
+
+
+def _cifar_safety_dataset(
+    variant: CifarVariant,
+    *,
+    train: bool,
+    data_root: str,
+    transform,
+    dangerous_classes: set[str],
+    unknown_classes: set[str],
+) -> SafetyDataset:
+    if variant == "cifar100":
+        base = CIFAR100(train=train, root=data_root, transform=transform)
+        return CIFAR100Safety.from_cifar100(
+            base,
+            dangerous_classes=dangerous_classes,
+            unknown_classes=unknown_classes,
+        )
+    base = CIFAR10(train=train, root=data_root, transform=transform)
+    return CIFAR10Safety.from_cifar10(
+        base,
+        dangerous_classes=dangerous_classes,
+        unknown_classes=unknown_classes,
+    )
 
 
 def _build_mode_subset(
@@ -217,15 +235,9 @@ def _class_to_kind(
     dangerous_idxs: set[int],
     known_idxs: set[int],
 ) -> SafetyKind:
-    is_dangerous = class_idx in dangerous_idxs
-    is_known = class_idx in known_idxs
-    if is_known and not is_dangerous:
-        return "k-safe"
-    if is_known and is_dangerous:
-        return "k-dang"
-    if not is_known and not is_dangerous:
-        return "u-safe"
-    return "u-dang"
+    d = class_idx in dangerous_idxs
+    k = class_idx in known_idxs
+    return ("u-safe", "u-dang", "k-safe", "k-dang")[int(k) * 2 + int(d)]
 
 
 @torch.no_grad()
@@ -235,11 +247,6 @@ def _eval_per_class(
     device: torch.device,
     num_classes: int,
 ) -> dict[str, torch.Tensor]:
-    """Per-class evaluation in a single pass.
-
-    Returns dict of tensors, each of shape ``(num_classes,)``:
-    count, top1, top5, loss.
-    """
     model.eval()
     criterion = nn.CrossEntropyLoss(reduction="none")
 
@@ -301,7 +308,6 @@ def _build_per_class_rows(
 
 
 def _aggregate(df: pl.DataFrame, group_col: str) -> pl.DataFrame:
-    """Aggregate per-class rows by *group_col*, computing weighted metrics."""
     return (
         df.group_by("step", group_col)
         .agg(
@@ -687,44 +693,23 @@ def main(config: UnlearnConfig) -> None:
         for ci in range(num_classes)
     }
 
-    if config.dataset == "cifar100":
-        cifar_train = CIFAR100(
-            train=True, root=config.data_root, transform=eval_transform
-        )
-        train_safety: SafetyDataset = CIFAR100Safety.from_cifar100(
-            cifar_train,
-            dangerous_classes=dangerous_set,
-            unknown_classes=unknown_set,
-        )
-    else:
-        cifar_train = CIFAR10(
-            train=True, root=config.data_root, transform=eval_transform
-        )
-        train_safety = CIFAR10Safety.from_cifar10(
-            cifar_train,
-            dangerous_classes=dangerous_set,
-            unknown_classes=unknown_set,
-        )
-
+    train_safety = _cifar_safety_dataset(
+        config.dataset,
+        train=True,
+        data_root=config.data_root,
+        transform=eval_transform,
+        dangerous_classes=dangerous_set,
+        unknown_classes=unknown_set,
+    )
     if config.eval_split == "test":
-        if config.dataset == "cifar100":
-            cifar_eval = CIFAR100(
-                train=False, root=config.data_root, transform=eval_transform
-            )
-            eval_safety: SafetyDataset = CIFAR100Safety.from_cifar100(
-                cifar_eval,
-                dangerous_classes=dangerous_set,
-                unknown_classes=unknown_set,
-            )
-        else:
-            cifar_eval = CIFAR10(
-                train=False, root=config.data_root, transform=eval_transform
-            )
-            eval_safety = CIFAR10Safety.from_cifar10(
-                cifar_eval,
-                dangerous_classes=dangerous_set,
-                unknown_classes=unknown_set,
-            )
+        eval_safety = _cifar_safety_dataset(
+            config.dataset,
+            train=False,
+            data_root=config.data_root,
+            transform=eval_transform,
+            dangerous_classes=dangerous_set,
+            unknown_classes=unknown_set,
+        )
     else:
         eval_safety = train_safety
 
@@ -747,11 +732,10 @@ def main(config: UnlearnConfig) -> None:
         num_workers=0,
     )
 
+    parent_idx = train_subset.dataset.indices
     n_retain = sum(
-        1
-        for idx in train_subset.indices
-        for base_idx in [train_subset.dataset.indices[idx]]
-        if str(train_safety.kind_arr[base_idx]) in retain_kinds
+        str(train_safety.kind_arr[int(parent_idx[pos])]) in retain_kinds
+        for pos in train_subset.indices
     )
     n_forget = len(train_subset) - n_retain
     kind_counts = {k: int((train_safety.kind_arr == k).sum()) for k in ALL_KINDS}

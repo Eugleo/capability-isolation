@@ -1,13 +1,14 @@
 # %%
 """Compute directed class-to-class distances via per-class unlearning on CIFAR-100.
 
-For each class X in CIFAR-100 we run NegGrad unlearning with:
+For each source class X in `CLASSES` we run NegGrad unlearning with:
   - X as the sole known danger (k-dang)
   - every other class as unknown safe (u-safe); there is no retain objective
-  - max_steps unlearning steps, evaluating every eval_every_n_steps on all classes
+  - `MAX_STEPS` unlearning steps, evaluating every `EVAL_EVERY_N_STEPS`
 
-Directed distance D[X -> Y] = first eval step at which the model's top-1 accuracy
-on class Y drops below `DISTANCE_THRESHOLD` during the unlearning of X.
+Directed distance D[X -> Y] = top-1 accuracy of the model on class Y at step
+`DISTANCE_STEP` of the unlearning of X. Smaller values => Y was more affected by
+unlearning X => X and Y are "closer" in representation space.
 
 All per-class experiment directories are written under EXPERIMENTS_ROOT. After the
 sweep we load metrics, compute distances, and produce:
@@ -35,12 +36,16 @@ from src.cifar.unlearn import UnlearnConfig, main as run_unlearn
 # %%
 # --- Config ---------------------------------------------------------------
 EXPERIMENTS_ROOT = Path("experiments/2026-04-17_class_distances")
-MAX_STEPS = 10_000
-EVAL_EVERY_N_STEPS = 200
-DISTANCE_THRESHOLD = 0.02  # top-1 accuracy below this = "class has been unlearned"
+MAX_STEPS = 500
+EVAL_EVERY_N_STEPS = 50
+DISTANCE_STEP = 500  # D[X, Y] = top-1 accuracy of Y at this step of X's unlearning
 SEED = 42
 SKIP_IF_METRICS_EXIST = True  # reuse existing per-class runs if present
 DISTANCES_CSV = EXPERIMENTS_ROOT / "distances.csv"
+# Source+target classes for the directed distance matrix. Each listed class gets
+# one unlearning run; the matrix is len(CLASSES) x len(CLASSES). Use
+# CIFAR100_CLASSES to sweep all 100.
+CLASSES: tuple[str, ...] = tuple(sorted(set(CIFAR100_CLASSES) - {"apple"}))
 
 # %%
 # --- Sweep: one unlearning run per CIFAR-100 class ------------------------
@@ -71,7 +76,7 @@ def _build_config(class_name: str) -> UnlearnConfig:
         max_steps=MAX_STEPS,
         eval_every_n_steps=EVAL_EVERY_N_STEPS,
         dangerous_classes=(class_name,),
-        known_classes=(class_name,),  # only this class is known -> k-dang; rest are u-safe
+        known_classes=(class_name, "apple"),  # only this class is known -> k-dang; apple is k-safe; rest are u-safe
         unlearning_strategy="ignore-unknown",
         eval_split="train",
         eval_class_groups={"all": CIFAR100_CLASSES},
@@ -81,9 +86,9 @@ def _build_config(class_name: str) -> UnlearnConfig:
 
 EXPERIMENTS_ROOT.mkdir(parents=True, exist_ok=True)
 
-for i, class_name in enumerate(CIFAR100_CLASSES, start=1):
+for i, class_name in enumerate(CLASSES, start=1):
     print(f"\n{'=' * 60}")
-    print(f"[{i}/{len(CIFAR100_CLASSES)}] source class: {class_name}")
+    print(f"[{i}/{len(CLASSES)}] source class: {class_name}")
     print(f"{'=' * 60}")
     existing = _find_existing_exp_dir(EXPERIMENTS_ROOT, class_name)
     if SKIP_IF_METRICS_EXIST and existing is not None:
@@ -93,57 +98,39 @@ for i, class_name in enumerate(CIFAR100_CLASSES, start=1):
 
 # %%
 # --- Load metrics and compute the directed distance matrix ----------------
-def _first_step_below(steps: np.ndarray, values: np.ndarray, threshold: float) -> float:
-    order = np.argsort(steps)
-    steps = steps[order]
-    values = values[order]
-    below = values < threshold
-    if not below.any():
-        return float("nan")
-    return float(steps[np.argmax(below)])
-
-
-def _distances_from_exp_dir(exp_dir: Path, threshold: float) -> dict[str, float]:
+def _accuracies_at_step(exp_dir: Path, step: int, targets: tuple[str, ...]) -> dict[str, float]:
     metrics = pl.read_csv(exp_dir / "metrics.csv")
-    top1 = metrics.filter(pl.col("metric") == "top1_acc")
-    out: dict[str, float] = {}
-    for target in CIFAR100_CLASSES:
-        sub = top1.filter(pl.col("class_name") == target)
-        if sub.is_empty():
-            out[target] = float("nan")
-            continue
-        steps = sub["step"].to_numpy()
-        values = sub["value"].to_numpy()
-        out[target] = _first_step_below(steps, values, threshold)
-    return out
+    top1 = metrics.filter((pl.col("metric") == "top1_acc") & (pl.col("step") == step))
+    value_by_class = dict(zip(top1["class_name"].to_list(), top1["value"].to_list()))
+    return {target: float(value_by_class.get(target, float("nan"))) for target in targets}
 
 
-class_to_idx = {c: i for i, c in enumerate(CIFAR100_CLASSES)}
-N = len(CIFAR100_CLASSES)
+class_to_idx = {c: i for i, c in enumerate(CLASSES)}
+N = len(CLASSES)
 D = np.full((N, N), np.nan, dtype=float)
 
 missing_sources: list[str] = []
-for source in CIFAR100_CLASSES:
+for source in CLASSES:
     exp_dir = _find_existing_exp_dir(EXPERIMENTS_ROOT, source)
     if exp_dir is None:
         missing_sources.append(source)
         continue
-    per_target = _distances_from_exp_dir(exp_dir, DISTANCE_THRESHOLD)
+    per_target = _accuracies_at_step(exp_dir, DISTANCE_STEP, CLASSES)
     s_idx = class_to_idx[source]
-    for target, dist in per_target.items():
-        D[s_idx, class_to_idx[target]] = dist
+    for target, acc in per_target.items():
+        D[s_idx, class_to_idx[target]] = acc
 
 if missing_sources:
-    print(f"WARNING: missing experiments for {len(missing_sources)} classes: {missing_sources[:5]}...")
+    print(f"WARNING: missing experiments for {len(missing_sources)} classes: {missing_sources}")
 
-n_never_crossed = int(np.isnan(D).sum())
-print(f"D shape: {D.shape}, NaNs (never crossed {DISTANCE_THRESHOLD:.0%}): {n_never_crossed}")
+n_missing = int(np.isnan(D).sum())
+print(f"D shape: {D.shape}, NaNs (no eval at step {DISTANCE_STEP}): {n_missing}")
 
 # %%
 # --- Save distances as tidy long CSV (source, target, distance) -----------
 rows: list[dict] = []
-for si, source in enumerate(CIFAR100_CLASSES):
-    for ti, target in enumerate(CIFAR100_CLASSES):
+for si, source in enumerate(CLASSES):
+    for ti, target in enumerate(CLASSES):
         rows.append({
             "source_idx": si,
             "source": source,
@@ -173,27 +160,30 @@ if np.isnan(D_sym_clean).any():
 condensed = squareform(D_sym_clean, checks=False)
 Z = linkage(condensed, method="average")
 order = leaves_list(Z)
-names_ordered = [CIFAR100_CLASSES[i] for i in order]
-print(f"Seriation order (first 10): {names_ordered[:10]}")
+names_ordered = [CLASSES[i] for i in order]
+print(f"Seriation order: {names_ordered}")
 
 # %%
 # --- Reordered directed heatmap -------------------------------------------
 D_reord = D[np.ix_(order, order)]
 
+label_fontsize = max(5, min(11, int(300 / max(N, 1))))
+
 fig, ax = plt.subplots(figsize=(16, 14))
-im = ax.imshow(D_reord, aspect="equal", cmap="viridis", interpolation="nearest")
+im = ax.imshow(D_reord, aspect="equal", cmap="viridis_r", interpolation="nearest", vmin=0, vmax=1)
 ax.set_xticks(range(N))
-ax.set_xticklabels(names_ordered, rotation=90, fontsize=5)
+ax.set_xticklabels(names_ordered, rotation=90, fontsize=label_fontsize)
 ax.set_yticks(range(N))
-ax.set_yticklabels(names_ordered, fontsize=5)
+ax.set_yticklabels(names_ordered, fontsize=label_fontsize)
 ax.set_xlabel("target class Y")
 ax.set_ylabel("source class X (unlearned)")
 ax.set_title(
-    f"Directed unlearning distance D[X → Y]: steps until top-1(Y) < {DISTANCE_THRESHOLD:.0%}\n"
-    f"(rows/cols reordered by average-linkage seriation on the symmetric distance)"
+    f"Directed unlearning distance D[X → Y] = top-1 acc(Y) at step {DISTANCE_STEP}\n"
+    f"(rows/cols reordered by average-linkage seriation on the symmetric distance; "
+    f"darker = Y more affected by unlearning X = closer)"
 )
 cbar = fig.colorbar(im, ax=ax, fraction=0.04, pad=0.02)
-cbar.set_label("steps")
+cbar.set_label(f"top-1 accuracy of Y at step {DISTANCE_STEP}")
 fig.tight_layout()
 plt.show()
 
@@ -210,14 +200,15 @@ ax.scatter(xs[finite], ys[finite], s=6, alpha=0.35, color="#1f77b4")
 mx = float(np.nanmax([xs, ys])) if finite.any() else 1.0
 ax.plot([0, mx], [0, mx], color="gray", linestyle="--", linewidth=1.0, alpha=0.7)
 
+pair_label_fontsize = 7 if len(iu_i) <= 50 else (5 if len(iu_i) <= 500 else 3)
 for i, j, x, y in zip(iu_i, iu_j, xs, ys):
     if not (np.isfinite(x) and np.isfinite(y)):
         continue
-    label = f"{CIFAR100_CLASSES[i]}↔{CIFAR100_CLASSES[j]}"
-    ax.annotate(label, (x, y), fontsize=3.0, alpha=0.55, color="#333333")
+    label = f"{CLASSES[i]}↔{CLASSES[j]}"
+    ax.annotate(label, (x, y), fontsize=pair_label_fontsize, alpha=0.7, color="#333333")
 
-ax.set_xlabel("D[X → Y]  (steps)")
-ax.set_ylabel("D[Y → X]  (steps)")
+ax.set_xlabel(f"D[X → Y]  (top-1 acc of Y at step {DISTANCE_STEP})")
+ax.set_ylabel(f"D[Y → X]  (top-1 acc of X at step {DISTANCE_STEP})")
 ax.set_title(
     "Symmetry of unlearning distance\n"
     "one point per unordered class pair; dashed line is y = x"
@@ -240,33 +231,37 @@ plt.show()
 # --- UMAP on the symmetric distance ---------------------------------------
 import umap
 
-reducer = umap.UMAP(
-    metric="precomputed",
-    n_neighbors=15,
-    min_dist=0.1,
-    random_state=SEED,
-)
-embedding_N2 = reducer.fit_transform(D_sym_clean)
-
-fig, ax = plt.subplots(figsize=(14, 12))
-ax.scatter(embedding_N2[:, 0], embedding_N2[:, 1], s=24, color="#1f77b4", alpha=0.8)
-for i, name in enumerate(CIFAR100_CLASSES):
-    ax.annotate(
-        name,
-        (embedding_N2[i, 0], embedding_N2[i, 1]),
-        fontsize=7,
-        xytext=(3, 3),
-        textcoords="offset points",
-        alpha=0.9,
+if N < 4:
+    print(f"Skipping UMAP: need >= 4 classes, got {N}")
+else:
+    n_neighbors = min(15, N - 1)
+    reducer = umap.UMAP(
+        metric="precomputed",
+        n_neighbors=n_neighbors,
+        min_dist=0.1,
+        random_state=SEED,
     )
-ax.set_xlabel("UMAP-1")
-ax.set_ylabel("UMAP-2")
-ax.set_title(
-    "UMAP of CIFAR-100 classes on symmetric unlearning distance\n"
-    f"metric='precomputed', n_neighbors={reducer.n_neighbors}, min_dist={reducer.min_dist}"
-)
-ax.grid(True, alpha=0.2)
-fig.tight_layout()
-plt.show()
+    embedding_N2 = reducer.fit_transform(D_sym_clean)
+
+    fig, ax = plt.subplots(figsize=(14, 12))
+    ax.scatter(embedding_N2[:, 0], embedding_N2[:, 1], s=24, color="#1f77b4", alpha=0.8)
+    for i, name in enumerate(CLASSES):
+        ax.annotate(
+            name,
+            (embedding_N2[i, 0], embedding_N2[i, 1]),
+            fontsize=8,
+            xytext=(3, 3),
+            textcoords="offset points",
+            alpha=0.9,
+        )
+    ax.set_xlabel("UMAP-1")
+    ax.set_ylabel("UMAP-2")
+    ax.set_title(
+        "UMAP of classes on symmetric unlearning distance\n"
+        f"metric='precomputed', n_neighbors={reducer.n_neighbors}, min_dist={reducer.min_dist}"
+    )
+    ax.grid(True, alpha=0.2)
+    fig.tight_layout()
+    plt.show()
 
 # %%

@@ -42,10 +42,11 @@ from src.cifar.unlearn import UnlearnConfig, main as run_unlearn
 # To reuse a prior sweep (e.g. just re-plot), set EXPERIMENTS_ROOT to the prior
 # path before running downstream cells.
 _RUN_TIMESTAMP = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-EXPERIMENTS_ROOT = Path(f"experiments/{_RUN_TIMESTAMP}_class_distances")
-MAX_STEPS = 500
+# EXPERIMENTS_ROOT = Path(f"experiments/{_RUN_TIMESTAMP}_class_distances")
+EXPERIMENTS_ROOT = Path(f"experiments/2026-04-17_16-47-04_class_distances")
+MAX_STEPS = 150
 EVAL_EVERY_N_STEPS = 50
-DISTANCE_STEP = 500  # D[X, Y] = top-1 accuracy of Y at this step of X's retraining
+DISTANCE_STEP = 150  # D[X, Y] = top-1 accuracy of Y at this step of X's retraining
 SEED = 42
 SKIP_IF_METRICS_EXIST = True  # reuse existing per-class runs if present
 DISTANCES_CSV = EXPERIMENTS_ROOT / "distances.csv"
@@ -255,11 +256,11 @@ import umap
 if N < 4:
     print(f"Skipping UMAP: need >= 4 classes, got {N}")
 else:
-    n_neighbors = min(5, N - 1)
+    n_neighbors = min(10, N - 1)
     reducer = umap.UMAP(
         metric="precomputed",
         n_neighbors=n_neighbors,
-        min_dist=0.05,
+        min_dist=0.005,
         random_state=SEED,
     )
     embedding_N2 = reducer.fit_transform(D_sym_clean)

@@ -1,10 +1,8 @@
 import json
 import uuid
-from dataclasses import asdict, dataclass
-from datetime import datetime
-from pathlib import Path
+from dataclasses import asdict, dataclass, field
+from typing import Literal
 
-import matplotlib.pyplot as plt
 import polars as pl
 import torch
 import torch.nn as nn
@@ -12,39 +10,43 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, Subset
 from torchvision import models
 
-from src.cifar.data import CIFAR10, CIFAR10Safety
-from src.cifar.train_resnet import (
-    get_eval_transform,
-    get_train_transform,
+from src.cifar.data import (
+    CIFAR100,
+    CIFAR100_CLASS_TO_INDEX,
+    CIFAR100_CLASSES,
+    CIFAR100Safety,
+    SafetyKind,
+)
+from src.cifar.train_resnet import get_eval_transform, get_train_transform
+from src.cifar.unlearn import (
+    ALL_KINDS,
+    _build_per_class_rows,
+    _class_metadata_frame,
+    _class_to_kind,
+    _create_experiment_dir,
+    _generate_plots,
+    _mean_typicality_per_class_index,
+    _per_class_wide_to_long,
 )
 from src.utils import get_device, set_seed
+
+EvalSplit = Literal["train", "test"]
 
 
 @dataclass
 class TrainSafetyClassifierConfig:
     name: str | None = None
     seed: int = 42
-    epochs: int = 50
+    epochs: int = 300
     lr: float = 1e-4
     weight_decay: float = 1e-4
     batch_size: int = 128
     data_root: str = "data"
-    dangerous_classes: tuple[str, ...] = ("cat",)
-    unknown_classes: tuple[str, ...] = ()
+    dangerous_classes: tuple[str, ...] = ()
+    known_classes: tuple[str, ...] = ()
+    eval_split: EvalSplit = "train"
+    eval_class_groups: dict[str, tuple[str, ...]] = field(default_factory=dict)
     experiments_root: str = "experiments"
-
-
-def _create_experiment_dir(root: str, *, name: str | None = None) -> Path:
-    experiments_root = Path(root)
-    experiments_root.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    if name:
-        exp_dir = experiments_root / f"{timestamp}_{name}"
-    else:
-        short_id = uuid.uuid4().hex[:8]
-        exp_dir = experiments_root / f"{timestamp}_{short_id}"
-    exp_dir.mkdir(parents=True)
-    return exp_dir
 
 
 def build_binary_cifar_resnet18() -> nn.Module:
@@ -62,39 +64,59 @@ def build_binary_cifar_resnet18() -> nn.Module:
     return model
 
 
-def _subset_from_mask(
-    dataset: CIFAR10Safety, mask: torch.Tensor
-) -> Subset[CIFAR10Safety]:
-    indices = torch.nonzero(mask, as_tuple=False).squeeze(1).tolist()
-    return Subset(dataset, indices)
-
-
-def build_known_unknown_subsets(
+def build_safety_classifier_configs_for_dangerous_grid(
     *,
-    base_train_dataset: CIFAR10,
-    base_eval_dataset: CIFAR10,
-    dangerous_classes: set[str],
-    unknown_classes: set[str] = frozenset(),
-) -> tuple[Subset[CIFAR10Safety], Subset[CIFAR10Safety]]:
-    train_safety = CIFAR10Safety.from_cifar10(
-        base_train_dataset,
-        dangerous_classes=dangerous_classes,
-        unknown_classes=unknown_classes,
-    )
-    test_safety = CIFAR10Safety.from_cifar10(
-        base_eval_dataset,
-        dangerous_classes=dangerous_classes,
-        unknown_classes=unknown_classes,
-    )
-    train_subset = _subset_from_mask(
-        train_safety,
-        torch.from_numpy(train_safety.is_label_known_arr),
-    )
-    test_subset = _subset_from_mask(
-        test_safety,
-        ~torch.from_numpy(test_safety.is_label_known_arr),
-    )
-    return train_subset, test_subset
+    dangerous_classes: tuple[str, ...],
+    safe_classes_ordered: tuple[str, ...],
+    class_names: tuple[str, ...],
+    name_prefix: str,
+    seed: int = 42,
+) -> list[TrainSafetyClassifierConfig]:
+    if not dangerous_classes:
+        raise ValueError("dangerous_classes must be non-empty")
+    dangerous_set = set(dangerous_classes)
+    if len(dangerous_set) != len(dangerous_classes):
+        raise ValueError("dangerous_classes must not contain duplicates")
+    for c in dangerous_classes:
+        if c not in class_names:
+            raise ValueError(
+                f"dangerous class {c!r} is not in this dataset's class list"
+            )
+
+    pool_safe_set = set(class_names) - dangerous_set
+    if set(safe_classes_ordered) != pool_safe_set:
+        raise ValueError(
+            "safe_classes_ordered must contain exactly the non-dangerous class names"
+        )
+    if len(safe_classes_ordered) != len(pool_safe_set):
+        raise ValueError("safe_classes_ordered must not contain duplicates")
+
+    n_dang = len(dangerous_classes)
+    configs: list[TrainSafetyClassifierConfig] = []
+    for k in range(1, n_dang + 1):
+        known_dangerous = list(dangerous_classes[:k])
+        known_safe = list(safe_classes_ordered[:k])
+        known_classes = tuple(sorted(known_dangerous + known_safe))
+        pct_tag = int(round(100 * k / n_dang))
+        name = f"safety_classifier_{name_prefix}_{pct_tag}p"
+        eval_class_groups: dict[str, tuple[str, ...]] = {"all": class_names}
+        configs.append(
+            TrainSafetyClassifierConfig(
+                name=name,
+                seed=seed,
+                dangerous_classes=dangerous_classes,
+                known_classes=known_classes,
+                eval_class_groups=eval_class_groups,
+            )
+        )
+    return configs
+
+
+def _subset_known(safety: CIFAR100Safety) -> Subset[CIFAR100Safety]:
+    indices = torch.nonzero(
+        torch.from_numpy(safety.is_label_known_arr), as_tuple=False
+    ).squeeze(1).tolist()
+    return Subset(safety, indices)
 
 
 def train_one_epoch(
@@ -103,7 +125,8 @@ def train_one_epoch(
     criterion: nn.Module,
     optimizer: optim.Optimizer,
     device: torch.device,
-) -> tuple[float, float]:
+    global_step: int,
+) -> tuple[float, float, int]:
     model.train()
     total_loss = 0.0
     total_correct = 0
@@ -111,129 +134,123 @@ def train_one_epoch(
 
     for batch in loader:
         images = batch["image"].to(device)
-        binary_targets = batch["is_dangerous"].to(device=device, dtype=torch.long)
+        targets = batch["is_dangerous"].to(device=device, dtype=torch.long)
 
         optimizer.zero_grad()
         logits = model(images)
-        loss = criterion(logits, binary_targets)
+        loss = criterion(logits, targets)
         loss.backward()
         optimizer.step()
 
-        total_loss += float(loss.item()) * binary_targets.size(0)
-        total_correct += logits.argmax(dim=1).eq(binary_targets).sum().item()
-        total_count += binary_targets.size(0)
+        total_loss += loss.detach().item() * targets.size(0)
+        total_correct += logits.argmax(dim=1).eq(targets).sum().item()
+        total_count += targets.size(0)
+        global_step += 1
 
-    return total_loss / max(total_count, 1), total_correct / max(total_count, 1)
-
-
-@torch.no_grad()
-def evaluate_binary(
-    model: nn.Module,
-    loader: DataLoader,
-    criterion: nn.Module,
-    device: torch.device,
-) -> tuple[float, float]:
-    model.eval()
-    total_loss = 0.0
-    total_correct = 0
-    total_count = 0
-
-    for batch in loader:
-        images = batch["image"].to(device)
-        binary_targets = batch["is_dangerous"].to(device=device, dtype=torch.long)
-        logits = model(images)
-        loss = criterion(logits, binary_targets)
-        total_loss += float(loss.item()) * binary_targets.size(0)
-        total_correct += logits.argmax(dim=1).eq(binary_targets).sum().item()
-        total_count += binary_targets.size(0)
-
-    return total_loss / max(total_count, 1), total_correct / max(total_count, 1)
+    return (
+        total_loss / max(total_count, 1),
+        total_correct / max(total_count, 1),
+        global_step,
+    )
 
 
 @torch.no_grad()
-def evaluate_binary_by_kind(
+def _eval_per_class_binary(
     model: nn.Module,
     loader: DataLoader,
-    criterion: nn.Module,
     device: torch.device,
-    kinds: tuple[str, ...],
-) -> dict[str, dict[str, float]]:
+    num_classes: int,
+) -> dict[str, torch.Tensor]:
+    """Per-class top-1/top-5/loss/count, with binary targets and CIFAR class scattering.
+
+    Mirrors `src.cifar.unlearn._eval_per_class` but uses the binary `is_dangerous`
+    target as the supervision while still bucketing per CIFAR-100 fine class.
+    """
     model.eval()
-    kind_loss_sum = {kind: 0.0 for kind in kinds}
-    kind_correct = {kind: 0 for kind in kinds}
-    kind_count = {kind: 0 for kind in kinds}
+    criterion = nn.CrossEntropyLoss(reduction="none")
+
+    counts = torch.zeros(num_classes, dtype=torch.long, device=device)
+    correct_top1 = torch.zeros(num_classes, dtype=torch.long, device=device)
+    correct_top5 = torch.zeros(num_classes, dtype=torch.long, device=device)
+    loss_sum = torch.zeros(num_classes, dtype=torch.double, device=device)
 
     for batch in loader:
         images = batch["image"].to(device)
-        binary_targets = batch["is_dangerous"].to(device=device, dtype=torch.long)
-        batch_kinds = list(batch["kind"])
+        labels = batch["label"].to(device)
+        targets = batch["is_dangerous"].to(device=device, dtype=torch.long)
+
         logits = model(images)
-        loss_per_sample = nn.functional.cross_entropy(
-            logits, binary_targets, reduction="none"
-        )
-        preds = logits.argmax(dim=1)
-        correct = preds.eq(binary_targets)
+        per_loss = criterion(logits, targets)
+        top1_hit = logits.argmax(dim=1).eq(targets)
+        k = min(5, logits.size(1))
+        top5_hit = logits.topk(k, dim=1).indices.eq(targets.unsqueeze(1)).any(dim=1)
 
-        for i, raw_kind in enumerate(batch_kinds):
-            kind = str(raw_kind)
-            if kind not in kind_count:
-                continue
-            kind_loss_sum[kind] += float(loss_per_sample[i].item())
-            kind_correct[kind] += int(correct[i].item())
-            kind_count[kind] += 1
+        counts.scatter_add_(0, labels, torch.ones_like(labels))
+        correct_top1.scatter_add_(0, labels, top1_hit.long())
+        correct_top5.scatter_add_(0, labels, top5_hit.long())
+        loss_sum.scatter_add_(0, labels, per_loss.double())
 
-    metrics: dict[str, dict[str, float]] = {}
-    for kind in kinds:
-        count = kind_count[kind]
-        metrics[kind] = {
-            "count": float(count),
-            "loss": kind_loss_sum[kind] / max(count, 1),
-            "accuracy": kind_correct[kind] / max(count, 1),
-        }
-    return metrics
+    return {
+        "count": counts.cpu(),
+        "top1": correct_top1.cpu(),
+        "top5": correct_top5.cpu(),
+        "loss": loss_sum.cpu(),
+    }
 
 
-def plot_metric_by_kind(
-    df: pl.DataFrame,
+def _run_eval(
+    model: nn.Module,
     *,
-    metric: str,
-    title: str,
-    save_path: Path,
-) -> None:
-    fig, ax = plt.subplots(figsize=(10, 6))
-    for kind in df["kind"].unique().to_list():
-        kind_df = df.filter(pl.col("kind") == kind).sort("epoch")
-        if kind_df.is_empty():
-            continue
-        ax.plot(
-            kind_df["epoch"].to_list(),
-            kind_df[metric].to_list(),
-            label=str(kind),
-            marker="o",
-            markersize=3,
-            linewidth=1.2,
-        )
-    ax.set_xlabel("Epoch")
-    ax.set_ylabel(metric.capitalize())
-    ax.set_title(title)
-    if metric == "accuracy":
-        ax.set_ylim(0, 1)
-    ax.grid(True, alpha=0.3)
-    ax.legend()
-    fig.tight_layout()
-    fig.savefig(save_path, dpi=150)
-    plt.close(fig)
-
-
-def train_safety_classifier(
-    *,
-    config: TrainSafetyClassifierConfig,
-    base_train_dataset: CIFAR10,
-    base_eval_dataset: CIFAR10,
+    eval_loader: DataLoader,
     device: torch.device,
+    step: int,
+    num_classes: int,
+    class_names: tuple[str, ...],
+    kind_map: dict[int, SafetyKind],
+    dangerous_idxs: set[int],
+    per_class_rows: list[dict],
 ) -> None:
+    stats = _eval_per_class_binary(model, eval_loader, device, num_classes)
+    rows = _build_per_class_rows(
+        stats,
+        step=step,
+        class_names=class_names,
+        kind_map=kind_map,
+    )
+    per_class_rows.extend(rows)
+
+    safe_idxs = set(range(num_classes)) - dangerous_idxs
+    dang_c = sum(int(stats["count"][i]) for i in dangerous_idxs)
+    dang_t1 = sum(int(stats["top1"][i]) for i in dangerous_idxs)
+    safe_c = sum(int(stats["count"][i]) for i in safe_idxs)
+    safe_t1 = sum(int(stats["top1"][i]) for i in safe_idxs)
+    total = safe_c + dang_c
+
+    print(
+        f"  [eval step={step}] top1: "
+        f"overall={((safe_t1 + dang_t1) / max(total, 1)):.2%}, "
+        f"safe={safe_t1 / max(safe_c, 1):.2%}, "
+        f"dang={dang_t1 / max(dang_c, 1):.2%}"
+    )
+
+
+def main(config: TrainSafetyClassifierConfig) -> None:
     if config.name is None:
         config.name = uuid.uuid4().hex[:8]
+
+    set_seed(config.seed)
+    device = get_device()
+
+    print(f"Using device: {device}")
+    print("Safety classifier config:")
+    print(f"  epochs: {config.epochs}")
+    print(f"  lr: {config.lr}")
+    print(f"  weight_decay: {config.weight_decay}")
+    print(f"  batch_size: {config.batch_size}")
+    print(f"  dangerous_classes: {config.dangerous_classes}")
+    print(f"  known_classes: {config.known_classes}")
+    print(f"  eval_split: {config.eval_split}")
+    print(f"  eval_class_groups: {config.eval_class_groups}")
 
     experiment_dir = _create_experiment_dir(
         config.experiments_root, name=config.name
@@ -242,30 +259,67 @@ def train_safety_classifier(
         json.dump(asdict(config), f, indent=2)
     print(f"Experiment dir: {experiment_dir}")
 
-    train_subset, test_subset = build_known_unknown_subsets(
-        base_train_dataset=base_train_dataset,
-        base_eval_dataset=base_eval_dataset,
-        dangerous_classes=set(config.dangerous_classes),
-        unknown_classes=set(config.unknown_classes),
+    class_names = CIFAR100_CLASSES
+    class_to_idx = CIFAR100_CLASS_TO_INDEX
+    num_classes = len(class_names)
+
+    dangerous_set = set(config.dangerous_classes)
+    if len(config.known_classes) == 0:
+        known_set = set(class_names)
+    else:
+        known_set = set(config.known_classes)
+    unknown_set = set(class_names) - known_set
+
+    dangerous_idxs = {class_to_idx[c] for c in dangerous_set}
+    known_idxs = {class_to_idx[c] for c in known_set}
+    kind_map = {
+        ci: _class_to_kind(ci, dangerous_idxs=dangerous_idxs, known_idxs=known_idxs)
+        for ci in range(num_classes)
+    }
+
+    base_train = CIFAR100(
+        train=True, root=config.data_root, transform=get_train_transform()
+    )
+    train_safety = CIFAR100Safety.from_cifar100(
+        base_train,
+        dangerous_classes=dangerous_set,
+        unknown_classes=unknown_set,
+    )
+    train_known_subset = _subset_known(train_safety)
+
+    base_eval = CIFAR100(
+        train=(config.eval_split == "train"),
+        root=config.data_root,
+        transform=get_eval_transform(),
+    )
+    eval_safety = CIFAR100Safety.from_cifar100(
+        base_eval,
+        dangerous_classes=dangerous_set,
+        unknown_classes=unknown_set,
     )
 
     train_loader = DataLoader(
-        train_subset,
+        train_known_subset,
         batch_size=config.batch_size,
         shuffle=True,
         num_workers=0,
     )
-    test_loader = DataLoader(
-        test_subset,
+    eval_loader = DataLoader(
+        eval_safety,
         batch_size=config.batch_size,
         shuffle=False,
         num_workers=0,
     )
 
+    kind_counts = {
+        k: int((train_safety.kind_arr == k).sum()) for k in ALL_KINDS
+    }
     print(
-        f"\nTraining safety classifier "
-        f"(train={len(train_subset)}, unknown-test={len(test_subset)})"
+        f"Train (known only)={len(train_known_subset)}, "
+        f"eval={len(eval_safety)} ({config.eval_split} split)"
     )
+    for k, c in kind_counts.items():
+        print(f"  {k}: {c}")
 
     model = build_binary_cifar_resnet18().to(device)
     optimizer = optim.Adam(
@@ -279,149 +333,98 @@ def train_safety_classifier(
         eta_min=config.lr * 0.1,
     )
     criterion = nn.CrossEntropyLoss()
-    train_kind_rows: list[dict[str, float | str]] = []
-    test_kind_rows: list[dict[str, float | str]] = []
+
+    per_class_rows: list[dict] = []
+    eval_kwargs = dict(
+        eval_loader=eval_loader,
+        device=device,
+        num_classes=num_classes,
+        class_names=class_names,
+        kind_map=kind_map,
+        dangerous_idxs=dangerous_idxs,
+        per_class_rows=per_class_rows,
+    )
+
+    global_step = 0
+    _run_eval(model, step=global_step, **eval_kwargs)
 
     for epoch in range(config.epochs):
-        train_loss, train_acc = train_one_epoch(
+        train_loss, train_acc, global_step = train_one_epoch(
             model=model,
             loader=train_loader,
             criterion=criterion,
             optimizer=optimizer,
             device=device,
+            global_step=global_step,
         )
-        test_loss, test_acc = evaluate_binary(
-            model=model,
-            loader=test_loader,
-            criterion=criterion,
-            device=device,
-        )
-        train_kind_metrics = evaluate_binary_by_kind(
-            model=model,
-            loader=train_loader,
-            criterion=criterion,
-            device=device,
-            kinds=("k-safe", "k-dang"),
-        )
-        unknown_kind_metrics = evaluate_binary_by_kind(
-            model=model,
-            loader=test_loader,
-            criterion=criterion,
-            device=device,
-            kinds=("u-safe", "u-dang"),
-        )
-        epoch_idx = float(epoch + 1)
-        for kind in ("k-safe", "k-dang"):
-            train_kind_rows.append(
-                {
-                    "epoch": epoch_idx,
-                    "kind": kind,
-                    "count": train_kind_metrics[kind]["count"],
-                    "loss": train_kind_metrics[kind]["loss"],
-                    "accuracy": train_kind_metrics[kind]["accuracy"],
-                }
-            )
-        for kind in ("u-safe", "u-dang"):
-            test_kind_rows.append(
-                {
-                    "epoch": epoch_idx,
-                    "kind": kind,
-                    "count": unknown_kind_metrics[kind]["count"],
-                    "loss": unknown_kind_metrics[kind]["loss"],
-                    "accuracy": unknown_kind_metrics[kind]["accuracy"],
-                }
-            )
         print(
-            f"Epoch {epoch + 1}/{config.epochs} - "
+            f"Epoch {epoch + 1}/{config.epochs} (step={global_step}) - "
             f"train/loss={train_loss:.4f}, train/accuracy={train_acc:.2%}, "
-            f"unknown/loss={test_loss:.4f}, unknown/accuracy={test_acc:.2%}, "
             f"lr={optimizer.param_groups[0]['lr']:.2e}"
         )
-        print(
-            "  train-known: "
-            f"k-safe(acc={train_kind_metrics['k-safe']['accuracy']:.2%}, "
-            f"loss={train_kind_metrics['k-safe']['loss']:.4f}, "
-            f"n={int(train_kind_metrics['k-safe']['count'])}) | "
-            f"k-dang(acc={train_kind_metrics['k-dang']['accuracy']:.2%}, "
-            f"loss={train_kind_metrics['k-dang']['loss']:.4f}, "
-            f"n={int(train_kind_metrics['k-dang']['count'])})"
-        )
-        print(
-            "  test-unknown: "
-            f"u-safe(acc={unknown_kind_metrics['u-safe']['accuracy']:.2%}, "
-            f"loss={unknown_kind_metrics['u-safe']['loss']:.4f}, "
-            f"n={int(unknown_kind_metrics['u-safe']['count'])}) | "
-            f"u-dang(acc={unknown_kind_metrics['u-dang']['accuracy']:.2%}, "
-            f"loss={unknown_kind_metrics['u-dang']['loss']:.4f}, "
-            f"n={int(unknown_kind_metrics['u-dang']['count'])})"
-        )
         scheduler.step()
+        _run_eval(model, step=global_step, **eval_kwargs)
+
+    pc_df = pl.DataFrame(per_class_rows)
+    metrics_long = _per_class_wide_to_long(pc_df)
+    metrics_long.write_csv(experiment_dir / "metrics.csv")
+    _class_metadata_frame(class_names, kind_map).write_csv(
+        experiment_dir / "class_metadata.csv"
+    )
+
+    _generate_plots(
+        pc_df,
+        kind_map=kind_map,
+        class_to_idx=class_to_idx,
+        out_dir=experiment_dir,
+        eval_class_groups=config.eval_class_groups,
+    )
 
     model_path = experiment_dir / "safety_classifier.pt"
-    train_csv_path = experiment_dir / "train_known_metrics.csv"
-    test_csv_path = experiment_dir / "test_unknown_metrics.csv"
-
     torch.save({"model_state_dict": model.state_dict()}, model_path)
-    train_kind_df = pl.DataFrame(train_kind_rows)
-    test_kind_df = pl.DataFrame(test_kind_rows)
-    train_kind_df.write_csv(train_csv_path)
-    test_kind_df.write_csv(test_csv_path)
 
-    plot_metric_by_kind(
-        train_kind_df,
-        metric="loss",
-        title="Train Known Loss by Kind",
-        save_path=experiment_dir / "train_known_loss_by_epoch.png",
-    )
-    plot_metric_by_kind(
-        train_kind_df,
-        metric="accuracy",
-        title="Train Known Accuracy by Kind",
-        save_path=experiment_dir / "train_known_accuracy_by_epoch.png",
-    )
-    plot_metric_by_kind(
-        test_kind_df,
-        metric="loss",
-        title="Test Unknown Loss by Kind",
-        save_path=experiment_dir / "test_unknown_loss_by_epoch.png",
-    )
-    plot_metric_by_kind(
-        test_kind_df,
-        metric="accuracy",
-        title="Test Unknown Accuracy by Kind",
-        save_path=experiment_dir / "test_unknown_accuracy_by_epoch.png",
-    )
-
+    print(f"Saved metrics to {experiment_dir / 'metrics.csv'}")
+    print(f"Saved class metadata to {experiment_dir / 'class_metadata.csv'}")
     print(f"Saved model to {model_path}")
-    print(f"Saved train-known metrics to {train_csv_path}")
-    print(f"Saved test-unknown metrics to {test_csv_path}")
-
-
-def main(config: TrainSafetyClassifierConfig) -> None:
-    if config.name is None:
-        config.name = uuid.uuid4().hex[:8]
-
-    set_seed(config.seed)
-    device = get_device()
-    print(f"Using device: {device}")
-
-    base_train_dataset = CIFAR10(
-        train=True, root=config.data_root, transform=get_train_transform()
-    )
-    base_eval_dataset = CIFAR10(
-        train=True, root=config.data_root, transform=get_eval_transform()
-    )
-
-    train_safety_classifier(
-        config=config,
-        base_train_dataset=base_train_dataset,
-        base_eval_dataset=base_eval_dataset,
-        device=device,
-    )
 
 
 if __name__ == "__main__":
-    config = TrainSafetyClassifierConfig()
-    dang_tag = "_".join(config.dangerous_classes)
-    config.name = f"safety_classifier_{dang_tag}"
-    main(config)
+    data_root = "data"
+    name_prefix = "people"
+    dangerous_classes: set[str] = {"man", "boy", "girl", "woman", "baby"}
+
+    cifar100_for_typ = CIFAR100(train=True, root=data_root, transform=None)
+    safety_for_typ = CIFAR100Safety.from_cifar100(
+        cifar100_for_typ,
+        dangerous_classes=dangerous_classes,
+        unknown_classes=frozenset(),
+    )
+    n_cls = len(CIFAR100_CLASSES)
+    mean_typ_idx = _mean_typicality_per_class_index(
+        safety_for_typ, num_classes=n_cls
+    )
+    mean_typ_by_name = {
+        CIFAR100_CLASSES[i]: float(mean_typ_idx[i]) for i in range(n_cls)
+    }
+    dangerous_classes_ordered = tuple(
+        sorted(dangerous_classes, key=lambda c: mean_typ_by_name[c], reverse=True)
+    )
+    safe_classes: set[str] = set(CIFAR100_CLASSES) - dangerous_classes
+    safe_classes_ordered = tuple(
+        sorted(safe_classes, key=lambda c: mean_typ_by_name[c], reverse=True)
+    )
+
+    configs = build_safety_classifier_configs_for_dangerous_grid(
+        dangerous_classes=dangerous_classes_ordered,
+        safe_classes_ordered=safe_classes_ordered,
+        class_names=CIFAR100_CLASSES,
+        name_prefix=name_prefix,
+        seed=42,
+    )
+
+    print(f"Running {len(configs)} experiments")
+    for i, config in enumerate(configs, 1):
+        print(f"\n{'=' * 60}")
+        print(f"[{i}/{len(configs)}] {config.name}")
+        print(f"{'=' * 60}")
+        main(config)

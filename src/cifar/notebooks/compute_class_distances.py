@@ -1,14 +1,15 @@
 # %%
-"""Compute directed class-to-class distances via per-class unlearning on CIFAR-100.
+"""Compute directed class-to-class distances via per-class retraining on CIFAR-100.
 
-For each source class X in `CLASSES` we run NegGrad unlearning with:
-  - X as the sole known danger (k-dang)
-  - every other class as unknown safe (u-safe); there is no retain objective
-  - `MAX_STEPS` unlearning steps, evaluating every `EVAL_EVERY_N_STEPS`
+For each source class X in `CLASSES` we run NegGrad with:
+  - no dangerous classes (nothing is in forget)
+  - X as the sole known safe (k-safe); every other class is unknown safe (u-safe)
+  - with strategy "ignore-unknown" this trains only on X (retain-only on X)
+  - `MAX_STEPS` steps, evaluating every `EVAL_EVERY_N_STEPS`
 
 Directed distance D[X -> Y] = top-1 accuracy of the model on class Y at step
-`DISTANCE_STEP` of the unlearning of X. Smaller values => Y was more affected by
-unlearning X => X and Y are "closer" in representation space.
+`DISTANCE_STEP` of the retraining on X. Smaller values => Y was more affected by
+retraining X => X and Y are "closer" in representation space.
 
 All per-class experiment directories are written under EXPERIMENTS_ROOT. After the
 sweep we load metrics, compute distances, and produce:
@@ -24,6 +25,7 @@ files. Run `uv sync` once to install the scipy + umap-learn dependencies.
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -35,17 +37,21 @@ from src.cifar.unlearn import UnlearnConfig, main as run_unlearn
 
 # %%
 # --- Config ---------------------------------------------------------------
-EXPERIMENTS_ROOT = Path("experiments/2026-04-17_class_distances")
+# Superdir follows the same timestamp-prefixed naming as `_create_experiment_dir`
+# in src/cifar/unlearn.py so repeated runs don't overwrite old sweeps.
+# To reuse a prior sweep (e.g. just re-plot), set EXPERIMENTS_ROOT to the prior
+# path before running downstream cells.
+_RUN_TIMESTAMP = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+EXPERIMENTS_ROOT = Path(f"experiments/{_RUN_TIMESTAMP}_class_distances")
 MAX_STEPS = 500
 EVAL_EVERY_N_STEPS = 50
-DISTANCE_STEP = 500  # D[X, Y] = top-1 accuracy of Y at this step of X's unlearning
+DISTANCE_STEP = 500  # D[X, Y] = top-1 accuracy of Y at this step of X's retraining
 SEED = 42
 SKIP_IF_METRICS_EXIST = True  # reuse existing per-class runs if present
 DISTANCES_CSV = EXPERIMENTS_ROOT / "distances.csv"
 # Source+target classes for the directed distance matrix. Each listed class gets
-# one unlearning run; the matrix is len(CLASSES) x len(CLASSES). Use
-# CIFAR100_CLASSES to sweep all 100.
-CLASSES: tuple[str, ...] = tuple(sorted(set(CIFAR100_CLASSES) - {"apple"}))
+# one retraining run; the matrix is len(CLASSES) x len(CLASSES).
+CLASSES: tuple[str, ...] = tuple(sorted(CIFAR100_CLASSES))
 
 # %%
 # --- Sweep: one unlearning run per CIFAR-100 class ------------------------
@@ -63,7 +69,10 @@ def _find_existing_exp_dir(root: Path, class_name: str) -> Path | None:
             cfg = json.loads(cfg_path.read_text())
         except Exception:
             continue
-        if list(cfg.get("dangerous_classes", [])) == [class_name]:
+        if (
+            list(cfg.get("dangerous_classes", [])) == []
+            and list(cfg.get("known_classes", [])) == [class_name]
+        ):
             return d
     return None
 
@@ -75,8 +84,8 @@ def _build_config(class_name: str) -> UnlearnConfig:
         seed=SEED,
         max_steps=MAX_STEPS,
         eval_every_n_steps=EVAL_EVERY_N_STEPS,
-        dangerous_classes=(class_name,),
-        known_classes=(class_name, "apple"),  # only this class is known -> k-dang; apple is k-safe; rest are u-safe
+        dangerous_classes=(),  # nothing to forget
+        known_classes=(class_name,),  # this class is the sole k-safe; rest are u-safe
         unlearning_strategy="ignore-unknown",
         eval_split="train",
         eval_class_groups={"all": CIFAR100_CLASSES},
@@ -86,6 +95,7 @@ def _build_config(class_name: str) -> UnlearnConfig:
 
 EXPERIMENTS_ROOT.mkdir(parents=True, exist_ok=True)
 
+# %%
 for i, class_name in enumerate(CLASSES, start=1):
     print(f"\n{'=' * 60}")
     print(f"[{i}/{len(CLASSES)}] source class: {class_name}")
@@ -125,6 +135,15 @@ if missing_sources:
 
 n_missing = int(np.isnan(D).sum())
 print(f"D shape: {D.shape}, NaNs (no eval at step {DISTANCE_STEP}): {n_missing}")
+
+# %%
+# --- Plots output directory -----------------------------------------------
+# Mirrors the name format used by `_create_experiment_dir` in src/cifar/unlearn.py
+# (timestamp prefix), with `_plots` appended instead of an experiment name.
+_PLOTS_TIMESTAMP = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+PLOTS_DIR = EXPERIMENTS_ROOT / f"{_PLOTS_TIMESTAMP}_plots"
+PLOTS_DIR.mkdir(parents=True, exist_ok=True)
+print(f"Plots dir: {PLOTS_DIR}")
 
 # %%
 # --- Save distances as tidy long CSV (source, target, distance) -----------
@@ -176,15 +195,16 @@ ax.set_xticklabels(names_ordered, rotation=90, fontsize=label_fontsize)
 ax.set_yticks(range(N))
 ax.set_yticklabels(names_ordered, fontsize=label_fontsize)
 ax.set_xlabel("target class Y")
-ax.set_ylabel("source class X (unlearned)")
+ax.set_ylabel("source class X (retrained)")
 ax.set_title(
-    f"Directed unlearning distance D[X → Y] = top-1 acc(Y) at step {DISTANCE_STEP}\n"
+    f"Directed retraining distance D[X → Y] = top-1 acc(Y) at step {DISTANCE_STEP}\n"
     f"(rows/cols reordered by average-linkage seriation on the symmetric distance; "
-    f"darker = Y more affected by unlearning X = closer)"
+    f"darker = Y more affected by retraining X = closer)"
 )
 cbar = fig.colorbar(im, ax=ax, fraction=0.04, pad=0.02)
 cbar.set_label(f"top-1 accuracy of Y at step {DISTANCE_STEP}")
 fig.tight_layout()
+fig.savefig(PLOTS_DIR / "heatmap_reordered.png", dpi=150)
 plt.show()
 
 # %%
@@ -210,7 +230,7 @@ for i, j, x, y in zip(iu_i, iu_j, xs, ys):
 ax.set_xlabel(f"D[X → Y]  (top-1 acc of Y at step {DISTANCE_STEP})")
 ax.set_ylabel(f"D[Y → X]  (top-1 acc of X at step {DISTANCE_STEP})")
 ax.set_title(
-    "Symmetry of unlearning distance\n"
+    "Symmetry of retraining distance\n"
     "one point per unordered class pair; dashed line is y = x"
 )
 ax.set_xlim(0, mx * 1.02)
@@ -225,6 +245,7 @@ ax.text(
     bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.85, edgecolor="none"),
 )
 fig.tight_layout()
+fig.savefig(PLOTS_DIR / "symmetry_scatter.png", dpi=150)
 plt.show()
 
 # %%
@@ -234,11 +255,11 @@ import umap
 if N < 4:
     print(f"Skipping UMAP: need >= 4 classes, got {N}")
 else:
-    n_neighbors = min(15, N - 1)
+    n_neighbors = min(5, N - 1)
     reducer = umap.UMAP(
         metric="precomputed",
         n_neighbors=n_neighbors,
-        min_dist=0.1,
+        min_dist=0.05,
         random_state=SEED,
     )
     embedding_N2 = reducer.fit_transform(D_sym_clean)
@@ -257,11 +278,12 @@ else:
     ax.set_xlabel("UMAP-1")
     ax.set_ylabel("UMAP-2")
     ax.set_title(
-        "UMAP of classes on symmetric unlearning distance\n"
+        "UMAP of classes on symmetric retraining distance\n"
         f"metric='precomputed', n_neighbors={reducer.n_neighbors}, min_dist={reducer.min_dist}"
     )
     ax.grid(True, alpha=0.2)
     fig.tight_layout()
+    fig.savefig(PLOTS_DIR / "umap.png", dpi=150)
     plt.show()
 
 # %%

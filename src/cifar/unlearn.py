@@ -89,7 +89,7 @@ class UnlearnConfig:
     name: str | None = None
     dataset: CifarVariant = "cifar100"
     seed: int = 42
-    max_steps: int = 5000
+    max_steps: int = 10000
     lr: float = 1e-5
     weight_decay: float = 0.0
     neggrad_forget_weight: float = 5e-5

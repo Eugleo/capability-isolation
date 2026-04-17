@@ -92,12 +92,18 @@ def build_safety_classifier_configs_for_dangerous_grid(
         raise ValueError("safe_classes_ordered must not contain duplicates")
 
     n_dang = len(dangerous_classes)
+    num_labels = len(class_names)
     configs: list[TrainSafetyClassifierConfig] = []
     for k in range(1, n_dang + 1):
         known_dangerous = list(dangerous_classes[:k])
-        known_safe = list(safe_classes_ordered[:k])
+        target_fraction = k / n_dang
+        target_known_total = min(num_labels, round(target_fraction * num_labels))
+        n_safe = max(
+            0, min(len(safe_classes_ordered), target_known_total - k)
+        )
+        known_safe = list(safe_classes_ordered[:n_safe])
         known_classes = tuple(sorted(known_dangerous + known_safe))
-        pct_tag = int(round(100 * k / n_dang))
+        pct_tag = int(round(100 * target_fraction))
         name = f"safety_classifier_{name_prefix}_{pct_tag}p"
         eval_class_groups: dict[str, tuple[str, ...]] = {"all": class_names}
         configs.append(

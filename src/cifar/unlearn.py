@@ -12,7 +12,7 @@ import polars as pl
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader, Dataset, Subset
 
 from src.cifar.data import (
     CIFAR10,
@@ -31,6 +31,10 @@ from src.utils import get_device, set_seed
 SafetyDataset = CIFAR10Safety | CIFAR100Safety
 
 ALL_KINDS: tuple[SafetyKind, ...] = ("k-safe", "k-dang", "u-safe", "u-dang")
+
+# Threshold on P(dangerous) used by the `classify-unknown` strategy to decide
+# whether an unknown-class item goes into the forget (>=) or retain (<) set.
+SAFETY_CLASSIFIER_THRESHOLD: float = 0.5
 GROUP_COLORS: dict[str, str] = {
     "k-dang": "red",
     "u-dang": "orange",
@@ -80,7 +84,13 @@ def _mean_typicality_per_class_index(safety: CIFAR100Safety, *, num_classes: int
         return sums / np.maximum(counts, 1)
 
 
-UnlearningStrategy = Literal["ignore-unknown", "retain-unknown", "forget-unknown"]
+UnlearningStrategy = Literal[
+    "ignore-unknown",
+    "retain-unknown",
+    "forget-unknown",
+    "classify-unknown",
+]
+Membership = Literal["retain", "forget", "exclude"]
 EvalSplit = Literal["train", "test"]
 
 
@@ -108,6 +118,10 @@ class UnlearnConfig:
     eval_class_groups: dict[str, tuple[str, ...]] = field(default_factory=dict)
 
     pretrained_model_path: str = "checkpoints/cifar100/train_resnet.pt"
+    # Path to a trained safety classifier (e.g.
+    # "experiments/.../safety_classifier.pt"). Only used when
+    # `unlearning_strategy == "classify-unknown"`.
+    safety_classifier_path: str | None = None
     experiments_root: str = "experiments"
 
 
@@ -128,6 +142,7 @@ def build_unlearn_configs_for_dangerous_grid(
     strategies: tuple[UnlearningStrategy, ...],
     seed: int,
     name_prefix: str | None = None,
+    safety_classifier_paths_by_pct: dict[int, str] | None = None,
 ) -> list[UnlearnConfig]:
     if not dangerous_classes:
         raise ValueError("dangerous_classes must be non-empty")
@@ -179,6 +194,20 @@ def build_unlearn_configs_for_dangerous_grid(
 
             tag = strategy.replace("-", "_")
             name = f"{stem}_{pct_tag}p_{tag}"
+
+            safety_classifier_path: str | None = None
+            if strategy == "classify-unknown":
+                if (
+                    safety_classifier_paths_by_pct is None
+                    or pct_tag not in safety_classifier_paths_by_pct
+                ):
+                    raise ValueError(
+                        "strategy 'classify-unknown' requires "
+                        "safety_classifier_paths_by_pct with an entry for "
+                        f"pct_tag={pct_tag}"
+                    )
+                safety_classifier_path = safety_classifier_paths_by_pct[pct_tag]
+
             configs.append(
                 UnlearnConfig(
                     name=name,
@@ -186,10 +215,64 @@ def build_unlearn_configs_for_dangerous_grid(
                     known_classes=known_classes,
                     unlearning_strategy=strategy,
                     eval_class_groups=eval_class_groups,
+                    safety_classifier_path=safety_classifier_path,
                 )
             )
 
     return configs
+
+
+def _find_safety_classifier_path(
+    *,
+    experiments_root: str,
+    name_prefix: str,
+    pct_tag: int,
+) -> Path:
+    root = Path(experiments_root)
+    if not root.exists():
+        raise FileNotFoundError(f"Experiments root does not exist: {root}")
+    suffix = f"_safety_classifier_{name_prefix}_{pct_tag}p"
+    candidates = sorted(
+        [
+            p
+            for p in root.iterdir()
+            if p.is_dir()
+            and p.name.endswith(suffix)
+            and (p / "safety_classifier.pt").exists()
+        ],
+        key=lambda p: p.name,
+    )
+    if not candidates:
+        raise FileNotFoundError(
+            f"No safety classifier experiment under {root} matching "
+            f"'*{suffix}' with a safety_classifier.pt file"
+        )
+    return candidates[-1] / "safety_classifier.pt"
+
+
+def _verify_classifier_matches_unlearn(
+    *,
+    classifier_path: Path,
+    expected_dangerous_classes: tuple[str, ...],
+    expected_known_classes: tuple[str, ...],
+) -> None:
+    config_path = classifier_path.parent / "config.json"
+    if not config_path.exists():
+        raise FileNotFoundError(f"Classifier config.json not found: {config_path}")
+    with open(config_path) as f:
+        cfg = json.load(f)
+    got_dang = tuple(cfg.get("dangerous_classes", ()))
+    got_known = tuple(cfg.get("known_classes", ()))
+    if tuple(sorted(got_dang)) != tuple(sorted(expected_dangerous_classes)):
+        raise ValueError(
+            f"Classifier at {classifier_path} has dangerous_classes={got_dang}, "
+            f"expected {expected_dangerous_classes}"
+        )
+    if tuple(sorted(got_known)) != tuple(sorted(expected_known_classes)):
+        raise ValueError(
+            f"Classifier at {classifier_path} has known_classes={got_known}, "
+            f"expected {expected_known_classes}"
+        )
 
 
 def _create_experiment_dir(root: str, *, name: str | None = None) -> Path:
@@ -205,17 +288,96 @@ def _create_experiment_dir(root: str, *, name: str | None = None) -> Path:
     return exp_dir
 
 
-def _strategy_to_kinds(
+@torch.no_grad()
+def _compute_classifier_dangerous_probs(
+    safety: SafetyDataset,
+    *,
+    classifier_path: str,
+    device: torch.device,
+    batch_size: int,
+) -> np.ndarray:
+    # Lazy import to avoid a circular dependency: train_safety_classifier imports
+    # from this module.
+    from src.cifar.train_safety_classifier import build_binary_cifar_resnet18
+
+    model = build_binary_cifar_resnet18().to(device)
+    checkpoint = torch.load(classifier_path, map_location=device, weights_only=True)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    model.eval()
+
+    loader = DataLoader(safety, batch_size=batch_size, shuffle=False, num_workers=0)
+    probs_chunks: list[np.ndarray] = []
+    for batch in loader:
+        images = batch["image"].to(device)
+        logits = model(images)
+        p_dangerous = torch.softmax(logits, dim=1)[:, 1]
+        probs_chunks.append(p_dangerous.detach().cpu().numpy())
+    return np.concatenate(probs_chunks, axis=0)
+
+
+def _compute_membership_arr(
+    safety: SafetyDataset,
+    *,
     strategy: UnlearningStrategy,
-) -> tuple[set[SafetyKind], set[SafetyKind]]:
-    retain: set[SafetyKind] = {"k-safe"}
-    forget: set[SafetyKind] = {"k-dang"}
-    extra_unknown: set[SafetyKind] = {"u-safe", "u-dang"}
-    if strategy == "retain-unknown":
-        retain |= extra_unknown
+    classifier_dangerous_probs: np.ndarray | None = None,
+    classifier_threshold: float = SAFETY_CLASSIFIER_THRESHOLD,
+) -> np.ndarray:
+    kind_arr = np.asarray(safety.kind_arr)
+    membership = np.empty(len(kind_arr), dtype=object)
+
+    # Known-class items keep their ground-truth assignment regardless of strategy.
+    membership[kind_arr == "k-safe"] = "retain"
+    membership[kind_arr == "k-dang"] = "forget"
+
+    unknown_mask = (kind_arr == "u-safe") | (kind_arr == "u-dang")
+    if strategy == "ignore-unknown":
+        membership[unknown_mask] = "exclude"
+    elif strategy == "retain-unknown":
+        membership[unknown_mask] = "retain"
     elif strategy == "forget-unknown":
-        forget |= extra_unknown
-    return retain, forget
+        membership[unknown_mask] = "forget"
+    elif strategy == "classify-unknown":
+        if classifier_dangerous_probs is None:
+            raise ValueError(
+                "classify-unknown strategy requires classifier_dangerous_probs"
+            )
+        if len(classifier_dangerous_probs) != len(kind_arr):
+            raise ValueError(
+                "classifier_dangerous_probs length does not match dataset length: "
+                f"{len(classifier_dangerous_probs)} vs {len(kind_arr)}"
+            )
+        predicted_dangerous = classifier_dangerous_probs >= classifier_threshold
+        membership[unknown_mask & predicted_dangerous] = "forget"
+        membership[unknown_mask & ~predicted_dangerous] = "retain"
+    else:
+        raise ValueError(f"unknown unlearning strategy: {strategy!r}")
+
+    return membership
+
+
+class _SafetyWithMembership(Dataset):
+    # Thin wrapper that injects a per-item `membership` label into the dataset dict
+    # so the training loop can mask retain vs forget samples without needing the
+    # ground-truth `kind` (which may disagree with membership when the strategy is
+    # `classify-unknown`).
+
+    def __init__(self, base: SafetyDataset, membership_arr: np.ndarray):
+        if len(membership_arr) != len(base):
+            raise ValueError(
+                "membership_arr length does not match dataset length: "
+                f"{len(membership_arr)} vs {len(base)}"
+            )
+        self.base = base
+        self.membership_arr = membership_arr
+        self.kind_arr = base.kind_arr
+
+    def __len__(self) -> int:
+        return len(self.base)
+
+    def __getitem__(self, idx: int) -> dict:
+        item = dict(self.base[idx])
+        item["membership"] = str(self.membership_arr[idx])
+        return item
 
 
 def _cifar_safety_dataset(
@@ -240,17 +402,6 @@ def _cifar_safety_dataset(
         dangerous_classes=dangerous_classes,
         unknown_classes=unknown_classes,
     )
-
-
-def _build_mode_subset(
-    subset: Subset[SafetyDataset], allowed_kinds: set[SafetyKind]
-) -> Subset[SafetyDataset]:
-    selected_positions: list[int] = []
-    for pos, base_idx in enumerate(subset.indices):
-        kind = subset.dataset.kind_arr[int(base_idx)]
-        if kind in allowed_kinds:
-            selected_positions.append(pos)
-    return Subset(subset, selected_positions)
 
 
 def _class_to_kind(
@@ -711,11 +862,9 @@ def main(config: UnlearnConfig) -> None:
     print(f"  dangerous_classes: {config.dangerous_classes}")
     print(f"  known_classes: {config.known_classes}")
     print(f"  unlearning_strategy: {config.unlearning_strategy}")
+    print(f"  safety_classifier_path: {config.safety_classifier_path}")
     print(f"  eval_split: {config.eval_split}")
     print(f"  eval_class_groups: {config.eval_class_groups}")
-
-    retain_kinds, forget_kinds = _strategy_to_kinds(config.unlearning_strategy)
-    train_kinds = retain_kinds | forget_kinds
 
     experiment_dir = _create_experiment_dir(config.experiments_root, name=config.name)
     with open(experiment_dir / "config.json", "w") as f:
@@ -766,10 +915,33 @@ def main(config: UnlearnConfig) -> None:
     else:
         eval_safety = train_safety
 
-    train_subset = _build_mode_subset(
-        Subset(train_safety, list(range(len(train_safety)))),
-        train_kinds,
+    classifier_dangerous_probs: np.ndarray | None = None
+    if config.unlearning_strategy == "classify-unknown":
+        if config.safety_classifier_path is None:
+            raise ValueError(
+                "unlearning_strategy='classify-unknown' requires "
+                "config.safety_classifier_path to be set"
+            )
+        print(
+            f"Running safety classifier {config.safety_classifier_path} "
+            f"on {len(train_safety)} train items (threshold={SAFETY_CLASSIFIER_THRESHOLD})"
+        )
+        classifier_dangerous_probs = _compute_classifier_dangerous_probs(
+            train_safety,
+            classifier_path=config.safety_classifier_path,
+            device=device,
+            batch_size=config.batch_size,
+        )
+
+    membership_arr = _compute_membership_arr(
+        train_safety,
+        strategy=config.unlearning_strategy,
+        classifier_dangerous_probs=classifier_dangerous_probs,
+        classifier_threshold=SAFETY_CLASSIFIER_THRESHOLD,
     )
+    train_dataset = _SafetyWithMembership(train_safety, membership_arr)
+    train_indices = np.nonzero(membership_arr != "exclude")[0].tolist()
+    train_subset = Subset(train_dataset, train_indices)
 
     train_loader = DataLoader(
         train_subset,
@@ -785,12 +957,8 @@ def main(config: UnlearnConfig) -> None:
         num_workers=0,
     )
 
-    parent_idx = train_subset.dataset.indices
-    n_retain = sum(
-        str(train_safety.kind_arr[int(parent_idx[pos])]) in retain_kinds
-        for pos in train_subset.indices
-    )
-    n_forget = len(train_subset) - n_retain
+    n_retain = int((membership_arr == "retain").sum())
+    n_forget = int((membership_arr == "forget").sum())
     kind_counts = {k: int((train_safety.kind_arr == k).sum()) for k in ALL_KINDS}
     print(
         f"Train={len(train_subset)} (retain={n_retain}, forget={n_forget}), "
@@ -798,6 +966,20 @@ def main(config: UnlearnConfig) -> None:
     )
     for k, c in kind_counts.items():
         print(f"  {k}: {c}")
+    if classifier_dangerous_probs is not None:
+        unknown_mask = np.isin(train_safety.kind_arr, ["u-safe", "u-dang"])
+        u_safe_mask = train_safety.kind_arr == "u-safe"
+        u_dang_mask = train_safety.kind_arr == "u-dang"
+        pred_dang = classifier_dangerous_probs >= SAFETY_CLASSIFIER_THRESHOLD
+        print(
+            "Classifier routing for unknown items: "
+            f"u-safe->forget={int((u_safe_mask & pred_dang).sum())}/"
+            f"{int(u_safe_mask.sum())}, "
+            f"u-dang->forget={int((u_dang_mask & pred_dang).sum())}/"
+            f"{int(u_dang_mask.sum())}, "
+            f"total unknown->forget={int((unknown_mask & pred_dang).sum())}/"
+            f"{int(unknown_mask.sum())}"
+        )
 
     model = build_cifar_resnet18(num_classes=num_classes).to(device)
     checkpoint = torch.load(
@@ -845,14 +1027,18 @@ def main(config: UnlearnConfig) -> None:
 
         images = batch["image"].to(device)
         labels = batch["label"].to(device)
-        kinds = list(batch["kind"])
+        memberships = list(batch["membership"])
 
         retain_mask = torch.tensor(
-            [str(k) in retain_kinds for k in kinds],
+            [m == "retain" for m in memberships],
             dtype=torch.bool,
             device=device,
         )
-        forget_mask = ~retain_mask
+        forget_mask = torch.tensor(
+            [m == "forget" for m in memberships],
+            dtype=torch.bool,
+            device=device,
+        )
 
         optimizer.zero_grad()
         logits = model(images)
@@ -918,13 +1104,9 @@ def main(config: UnlearnConfig) -> None:
 
 if __name__ == "__main__":
     data_root = "data"
-    dangerous_classes: set[str] = {
-        "forest",
-        "willow_tree",
-        "maple_tree",
-        "oak_tree",
-        "pine_tree",
-    }
+    experiments_root = "experiments"
+    name_prefix = "people"
+    dangerous_classes: set[str] = {"man", "boy", "girl", "woman", "baby"}
 
     cifar100_for_typ = CIFAR100(train=True, root=data_root, transform=None)
     safety_for_typ = CIFAR100Safety.from_cifar100(
@@ -946,10 +1128,41 @@ if __name__ == "__main__":
     )
 
     strategies: tuple[UnlearningStrategy, ...] = (
+        "classify-unknown",
         "ignore-unknown",
         "forget-unknown",
         "retain-unknown",
     )
+
+    # For each k (pct_tag) used by the unlearn grid, locate the matching
+    # safety classifier checkpoint and verify its training split shares the
+    # same dangerous/known classes as the unlearn run.
+    n_dang = len(dangerous_classes_ordered)
+    ks = [1] if n_dang == 1 else list(range(1, n_dang))
+    num_labels = len(CIFAR100_CLASSES)
+    safety_classifier_paths_by_pct: dict[int, str] = {}
+    for k in ks:
+        pct_tag = int(round(100 * k / n_dang))
+        classifier_path = _find_safety_classifier_path(
+            experiments_root=experiments_root,
+            name_prefix=name_prefix,
+            pct_tag=pct_tag,
+        )
+        # Reproduce build_unlearn_configs_for_dangerous_grid's recipe to
+        # compute the expected known_classes for this k.
+        known_dangerous = set(dangerous_classes_ordered[:k])
+        target_known_total = min(num_labels, round((k / n_dang) * num_labels))
+        n_safe = max(0, min(len(safe_classes_ordered), target_known_total - k))
+        expected_known = tuple(
+            sorted(known_dangerous | set(safe_classes_ordered[:n_safe]))
+        )
+        _verify_classifier_matches_unlearn(
+            classifier_path=classifier_path,
+            expected_dangerous_classes=dangerous_classes_ordered,
+            expected_known_classes=expected_known,
+        )
+        print(f"[{pct_tag}p] classifier: {classifier_path}")
+        safety_classifier_paths_by_pct[pct_tag] = str(classifier_path)
 
     configs = build_unlearn_configs_for_dangerous_grid(
         dangerous_classes=dangerous_classes_ordered,
@@ -957,7 +1170,8 @@ if __name__ == "__main__":
         class_names=CIFAR100_CLASSES,
         strategies=strategies,
         seed=42,
-        name_prefix="tree",
+        name_prefix=name_prefix,
+        safety_classifier_paths_by_pct=safety_classifier_paths_by_pct,
     )
 
     print(f"Running {len(configs)} experiments")

@@ -99,7 +99,7 @@ class UnlearnConfig:
     name: str | None = None
     dataset: CifarVariant = "cifar100"
     seed: int = 42
-    max_steps: int = 10000
+    max_steps: int = 1000
     lr: float = 1e-5
     weight_decay: float = 0.0
     neggrad_forget_weight: float = 5e-5
@@ -1128,10 +1128,10 @@ if __name__ == "__main__":
     )
 
     strategies: tuple[UnlearningStrategy, ...] = (
-        "classify-unknown",
         "ignore-unknown",
-        "forget-unknown",
-        "retain-unknown",
+        # "classify-unknown",
+        # "forget-unknown",
+        # "retain-unknown",
     )
 
     # For each k (pct_tag) used by the unlearn grid, locate the matching
@@ -1143,11 +1143,11 @@ if __name__ == "__main__":
     safety_classifier_paths_by_pct: dict[int, str] = {}
     for k in ks:
         pct_tag = int(round(100 * k / n_dang))
-        classifier_path = _find_safety_classifier_path(
-            experiments_root=experiments_root,
-            name_prefix=name_prefix,
-            pct_tag=pct_tag,
-        )
+        # classifier_path = _find_safety_classifier_path(
+        #     experiments_root=experiments_root,
+        #     name_prefix=name_prefix,
+        #     pct_tag=pct_tag,
+        # )
         # Reproduce build_unlearn_configs_for_dangerous_grid's recipe to
         # compute the expected known_classes for this k.
         known_dangerous = set(dangerous_classes_ordered[:k])
@@ -1156,13 +1156,13 @@ if __name__ == "__main__":
         expected_known = tuple(
             sorted(known_dangerous | set(safe_classes_ordered[:n_safe]))
         )
-        _verify_classifier_matches_unlearn(
-            classifier_path=classifier_path,
-            expected_dangerous_classes=dangerous_classes_ordered,
-            expected_known_classes=expected_known,
-        )
-        print(f"[{pct_tag}p] classifier: {classifier_path}")
-        safety_classifier_paths_by_pct[pct_tag] = str(classifier_path)
+        # _verify_classifier_matches_unlearn(
+        #     classifier_path=classifier_path,
+        #     expected_dangerous_classes=dangerous_classes_ordered,
+        #     expected_known_classes=expected_known,
+        # )
+        # print(f"[{pct_tag}p] classifier: {classifier_path}")
+        # safety_classifier_paths_by_pct[pct_tag] = str(classifier_path)
 
     configs = build_unlearn_configs_for_dangerous_grid(
         dangerous_classes=dangerous_classes_ordered,

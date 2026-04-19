@@ -1,6 +1,6 @@
 import json
 import uuid
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Literal
 
@@ -48,7 +48,7 @@ class TrainNaiveSystemConfig:
     name: str | None = None
     seed: int = 42
 
-    max_steps: int = 10000
+    max_steps: int = 20000
     lr: float = 1e-5
     weight_decay: float = 0.0
     batch_size: int = 128
@@ -68,7 +68,9 @@ class TrainNaiveSystemConfig:
     is_gate_trainable: bool = True
 
     # Init paths; None means freshly initialized weights.
-    safe_model_path: str | None = "checkpoints/cifar100/train_resnet.pt"
+    safe_model_path: str | None = (
+        "experiments/2026-04-19_13-33-28_people_20p_ignore_unknown/unlearned_model.pt"
+    )
     dangerous_model_path: str | None = "checkpoints/cifar100/train_resnet.pt"
     gate_path: str | None = None
 
@@ -727,6 +729,7 @@ def build_naive_system_configs_for_dangerous_grid(
     name_prefix: str,
     seed: int = 42,
     safety_classifier_paths_by_pct: dict[int, str] | None = None,
+    only_pct: int | None = None,
 ) -> list[TrainNaiveSystemConfig]:
     if not dangerous_classes:
         raise ValueError("dangerous_classes must be non-empty")
@@ -759,6 +762,8 @@ def build_naive_system_configs_for_dangerous_grid(
         known_classes = tuple(sorted(known_dangerous + known_safe))
 
         pct_tag = int(round(100 * target_fraction))
+        if only_pct is not None and pct_tag != only_pct:
+            continue
         name = f"naive_system_{name_prefix}_{pct_tag}p"
         eval_class_groups: dict[str, tuple[str, ...]] = {"all": class_names}
 
@@ -805,15 +810,43 @@ if __name__ == "__main__":
         sorted(safe_classes, key=lambda c: mean_typ_by_name[c], reverse=True)
     )
 
-    configs = build_naive_system_configs_for_dangerous_grid(
+    # configs = build_naive_system_configs_for_dangerous_grid(
+    #     dangerous_classes=dangerous_classes_ordered,
+    #     safe_classes_ordered=safe_classes_ordered,
+    #     class_names=CIFAR100_CLASSES,
+    #     name_prefix=name_prefix,
+    #     seed=42,
+    # )
+    # print(f"Running {len(configs)} experiments")
+    # for i, config in enumerate(configs, 1):
+    #     print(f"\n{'=' * 60}")
+    #     print(f"[{i}/{len(configs)}] {config.name}")
+    #     print(f"{'=' * 60}")
+    #     main(config)
+
+    grid_configs = build_naive_system_configs_for_dangerous_grid(
         dangerous_classes=dangerous_classes_ordered,
         safe_classes_ordered=safe_classes_ordered,
         class_names=CIFAR100_CLASSES,
         name_prefix=name_prefix,
         seed=42,
+        only_pct=20,
     )
+    if len(grid_configs) != 1:
+        raise RuntimeError(f"expected exactly one 20p config, got {len(grid_configs)}")
+    base_20p = grid_configs[0]
+    gate_bce_weights = (0, 1e-3, 1e-2, 1e-1, 1)
+    configs = [
+        replace(
+            base_20p,
+            name=f"{base_20p.name}_gate_loss_w={str(w).replace('.', 'p')}",
+            gate_bce_weight=w,
+            max_steps=4000,
+        )
+        for w in gate_bce_weights
+    ]
 
-    print(f"Running {len(configs)} experiments")
+    print(f"Running {len(configs)} experiments (20p base, gate BCE sweep)")
     for i, config in enumerate(configs, 1):
         print(f"\n{'=' * 60}")
         print(f"[{i}/{len(configs)}] {config.name}")

@@ -22,6 +22,12 @@ from src.cifar.train_resnet import build_cifar_resnet18, get_eval_transform
 from src.cifar.train_safety_classifier import build_binary_cifar_resnet18
 from src.cifar.unlearn import (
     ALL_KINDS,
+    GROUP_COLORS,
+    GROUP_LINESTYLES,
+    PER_CLASS_COLORS,
+    PER_CLASS_METRIC_COLUMNS,
+    _add_safety_col,
+    _aggregate,
     _build_per_class_rows,
     _class_metadata_frame,
     _class_to_kind,
@@ -30,6 +36,7 @@ from src.cifar.unlearn import (
     _generate_plots,
     _mean_typicality_per_class_index,
     _per_class_wide_to_long,
+    _plot_lines,
 )
 from src.utils import get_device, set_seed
 
@@ -116,6 +123,163 @@ def _build_naive_system(
 
 
 @torch.no_grad()
+def _eval_per_class_gate(
+    system: NaiveSystem,
+    loader: DataLoader,
+    device: torch.device,
+    num_classes: int,
+) -> dict[str, torch.Tensor]:
+    system.eval()
+    criterion = nn.CrossEntropyLoss(reduction="none")
+
+    counts = torch.zeros(num_classes, dtype=torch.long, device=device)
+    correct_top1 = torch.zeros(num_classes, dtype=torch.long, device=device)
+    correct_top5 = torch.zeros(num_classes, dtype=torch.long, device=device)
+    loss_sum = torch.zeros(num_classes, dtype=torch.double, device=device)
+    gate_sum = torch.zeros(num_classes, dtype=torch.double, device=device)
+
+    for batch in loader:
+        images = batch["image"].to(device)
+        labels = batch["label"].to(device)
+        targets = batch["is_dangerous"].to(device=device, dtype=torch.long)
+
+        gate_logits_B2 = system.gate(images)
+        per_loss = criterion(gate_logits_B2, targets)
+        top1_hit = gate_logits_B2.argmax(dim=1).eq(targets)
+        k = min(5, gate_logits_B2.size(1))
+        top5_hit = (
+            gate_logits_B2.topk(k, dim=1).indices.eq(targets.unsqueeze(1)).any(dim=1)
+        )
+        gate_value_B = torch.softmax(gate_logits_B2, dim=1)[:, 1].double()
+
+        counts.scatter_add_(0, labels, torch.ones_like(labels))
+        correct_top1.scatter_add_(0, labels, top1_hit.long())
+        correct_top5.scatter_add_(0, labels, top5_hit.long())
+        loss_sum.scatter_add_(0, labels, per_loss.double())
+        gate_sum.scatter_add_(0, labels, gate_value_B)
+
+    return {
+        "count": counts.cpu(),
+        "top1": correct_top1.cpu(),
+        "top5": correct_top5.cpu(),
+        "loss": loss_sum.cpu(),
+        "gate_sum": gate_sum.cpu(),
+    }
+
+
+def _build_gate_rows(
+    stats: dict[str, torch.Tensor],
+    *,
+    step: int,
+    class_names: tuple[str, ...],
+    kind_map: dict[int, SafetyKind],
+) -> list[dict]:
+    rows = _build_per_class_rows(
+        stats, step=step, class_names=class_names, kind_map=kind_map
+    )
+    for ci, row in enumerate(rows):
+        c = int(stats["count"][ci])
+        gs = float(stats["gate_sum"][ci])
+        row["gate_sum"] = gs
+        row["avg_gate"] = gs / c if c > 0 else float("nan")
+    return rows
+
+
+GATE_PER_CLASS_METRIC_COLUMNS: tuple[str, ...] = tuple(PER_CLASS_METRIC_COLUMNS) + (
+    "gate_sum",
+    "avg_gate",
+)
+
+
+def _gate_per_class_wide_to_long(wide: pl.DataFrame) -> pl.DataFrame:
+    return wide.unpivot(
+        index=["step", "class_idx", "class_name"],
+        on=list(GATE_PER_CLASS_METRIC_COLUMNS),
+        variable_name="metric",
+        value_name="value",
+    ).sort("step", "class_idx", "metric")
+
+
+def _aggregate_gate(df: pl.DataFrame, group_col: str) -> pl.DataFrame:
+    return (
+        df.group_by("step", group_col)
+        .agg(pl.col("count").sum(), pl.col("gate_sum").sum())
+        .with_columns(
+            pl.when(pl.col("count") > 0)
+            .then(pl.col("gate_sum") / pl.col("count"))
+            .otherwise(pl.lit(float("nan")))
+            .alias("avg_gate")
+        )
+        .sort("step", group_col)
+    )
+
+
+def _generate_gate_avg_plots(
+    pc_df: pl.DataFrame,
+    *,
+    kind_map: dict[int, SafetyKind],
+    class_to_idx: dict[str, int],
+    out_dir: Path,
+    eval_class_groups: dict[str, tuple[str, ...]],
+) -> None:
+    for group_name, group_classes in eval_class_groups.items():
+        group_class_set = set(group_classes)
+        grp_df = pc_df.filter(pl.col("class_name").is_in(group_class_set))
+        if grp_df.is_empty():
+            continue
+
+        grp_dir = out_dir / group_name
+        grp_dir.mkdir(parents=True, exist_ok=True)
+
+        grp_kind_df = _aggregate_gate(grp_df, "kind")
+        grp_safety_df = _aggregate_gate(_add_safety_col(grp_df), "safety")
+        grp_class_df = _aggregate_gate(grp_df, "class_name")
+
+        grp_class_names = tuple(sorted(grp_df["class_name"].unique().to_list()))
+        grp_colors: dict[str, str] = {}
+        grp_linestyles: dict[str, str] = {}
+        grp_markers: dict[str, str] = {}
+        for i, cn in enumerate(grp_class_names):
+            kind = kind_map[class_to_idx[cn]]
+            grp_colors[cn] = PER_CLASS_COLORS[i % len(PER_CLASS_COLORS)]
+            grp_markers[cn] = "*" if kind in ("k-dang", "u-dang") else "o"
+            grp_linestyles[cn] = "--" if kind in ("u-safe", "u-dang") else "-"
+
+        _plot_lines(
+            grp_kind_df,
+            group_col="kind",
+            groups=ALL_KINDS,
+            colors=GROUP_COLORS,
+            linestyles=GROUP_LINESTYLES,
+            metric="avg_gate",
+            title=f"{group_name}: Avg gate value by Kind",
+            save_path=grp_dir / "avg_gate_by_kind.png",
+        )
+        _plot_lines(
+            grp_safety_df,
+            group_col="safety",
+            groups=("safe", "dangerous"),
+            colors=GROUP_COLORS,
+            linestyles=GROUP_LINESTYLES,
+            metric="avg_gate",
+            title=f"{group_name}: Avg gate value: Safe vs Dangerous",
+            save_path=grp_dir / "avg_gate_safe_vs_dang.png",
+        )
+        _plot_lines(
+            grp_class_df,
+            group_col="class_name",
+            groups=grp_class_names,
+            colors=grp_colors,
+            linestyles=grp_linestyles,
+            markers=grp_markers,
+            metric="avg_gate",
+            title=f"{group_name}: Avg gate value by Class",
+            save_path=grp_dir / "avg_gate_by_class.png",
+            label_line_endpoints=True,
+        )
+
+
+@torch.no_grad()
 def _eval_per_class_system(
     system: NaiveSystem,
     loader: DataLoader,
@@ -174,6 +338,63 @@ def _summarize_top1(
     )
 
 
+def _save_outputs(
+    *,
+    experiment_dir: Path,
+    rows_safe: list[dict],
+    rows_dangerous: list[dict],
+    rows_system: list[dict],
+    rows_gate: list[dict],
+    kind_map: dict[int, SafetyKind],
+    class_to_idx: dict[str, int],
+    class_names: tuple[str, ...],
+    eval_class_groups: dict[str, tuple[str, ...]],
+    verbose: bool = False,
+) -> None:
+    for sub_name, rows in [
+        ("safe", rows_safe),
+        ("dangerous", rows_dangerous),
+        ("system", rows_system),
+    ]:
+        if not rows:
+            continue
+        sub_dir = experiment_dir / sub_name
+        sub_dir.mkdir(parents=True, exist_ok=True)
+        pc_df = pl.DataFrame(rows)
+        _per_class_wide_to_long(pc_df).write_csv(sub_dir / "metrics.csv")
+        _generate_plots(
+            pc_df,
+            kind_map=kind_map,
+            class_to_idx=class_to_idx,
+            out_dir=sub_dir,
+            eval_class_groups=eval_class_groups,
+        )
+        if verbose:
+            print(f"Saved {sub_name} metrics + plots to {sub_dir}")
+
+    if rows_gate:
+        gate_dir = experiment_dir / "gate"
+        gate_dir.mkdir(parents=True, exist_ok=True)
+        gate_pc_df = pl.DataFrame(rows_gate)
+        _gate_per_class_wide_to_long(gate_pc_df).write_csv(gate_dir / "metrics.csv")
+        _generate_plots(
+            gate_pc_df,
+            kind_map=kind_map,
+            class_to_idx=class_to_idx,
+            out_dir=gate_dir,
+            eval_class_groups=eval_class_groups,
+        )
+        _generate_gate_avg_plots(
+            gate_pc_df,
+            kind_map=kind_map,
+            class_to_idx=class_to_idx,
+            out_dir=gate_dir,
+            eval_class_groups=eval_class_groups,
+        )
+        if verbose:
+            print(f"Saved gate metrics + plots to {gate_dir}")
+
+
 def _run_eval(
     system: NaiveSystem,
     *,
@@ -182,11 +403,15 @@ def _run_eval(
     step: int,
     num_classes: int,
     class_names: tuple[str, ...],
+    class_to_idx: dict[str, int],
     kind_map: dict[int, SafetyKind],
     dangerous_idxs: set[int],
     rows_safe: list[dict],
     rows_dangerous: list[dict],
     rows_system: list[dict],
+    rows_gate: list[dict],
+    experiment_dir: Path,
+    eval_class_groups: dict[str, tuple[str, ...]],
 ) -> None:
     safe_stats = _eval_per_class(
         system.model_safe, eval_loader, device, num_classes
@@ -195,6 +420,7 @@ def _run_eval(
         system.model_dangerous, eval_loader, device, num_classes
     )
     sys_stats = _eval_per_class_system(system, eval_loader, device, num_classes)
+    gate_stats = _eval_per_class_gate(system, eval_loader, device, num_classes)
 
     rows_safe.extend(
         _build_per_class_rows(
@@ -211,6 +437,11 @@ def _run_eval(
             sys_stats, step=step, class_names=class_names, kind_map=kind_map
         )
     )
+    rows_gate.extend(
+        _build_gate_rows(
+            gate_stats, step=step, class_names=class_names, kind_map=kind_map
+        )
+    )
 
     print(
         f"  [eval step={step}] safe top1: "
@@ -223,6 +454,22 @@ def _run_eval(
     print(
         f"  [eval step={step}] system top1: "
         f"{_summarize_top1(sys_stats, dangerous_idxs=dangerous_idxs, num_classes=num_classes)}"
+    )
+    print(
+        f"  [eval step={step}] gate top1: "
+        f"{_summarize_top1(gate_stats, dangerous_idxs=dangerous_idxs, num_classes=num_classes)}"
+    )
+
+    _save_outputs(
+        experiment_dir=experiment_dir,
+        rows_safe=rows_safe,
+        rows_dangerous=rows_dangerous,
+        rows_system=rows_system,
+        rows_gate=rows_gate,
+        kind_map=kind_map,
+        class_to_idx=class_to_idx,
+        class_names=class_names,
+        eval_class_groups=eval_class_groups,
     )
 
 
@@ -339,16 +586,21 @@ def main(config: TrainNaiveSystemConfig) -> None:
     rows_safe: list[dict] = []
     rows_dangerous: list[dict] = []
     rows_system: list[dict] = []
+    rows_gate: list[dict] = []
     eval_kwargs = dict(
         eval_loader=eval_loader,
         device=device,
         num_classes=num_classes,
         class_names=class_names,
+        class_to_idx=class_to_idx,
         kind_map=kind_map,
         dangerous_idxs=dangerous_idxs,
         rows_safe=rows_safe,
         rows_dangerous=rows_dangerous,
         rows_system=rows_system,
+        rows_gate=rows_gate,
+        experiment_dir=experiment_dir,
+        eval_class_groups=config.eval_class_groups,
     )
 
     _run_eval(system, step=0, **eval_kwargs)
@@ -456,25 +708,6 @@ def main(config: TrainNaiveSystemConfig) -> None:
 
     if global_step % config.eval_every_n_steps != 0:
         _run_eval(system, step=global_step, **eval_kwargs)
-
-    for sub_name, rows in [
-        ("safe", rows_safe),
-        ("dangerous", rows_dangerous),
-        ("system", rows_system),
-    ]:
-        sub_dir = experiment_dir / sub_name
-        sub_dir.mkdir(parents=True, exist_ok=True)
-        pc_df = pl.DataFrame(rows)
-        metrics_long = _per_class_wide_to_long(pc_df)
-        metrics_long.write_csv(sub_dir / "metrics.csv")
-        _generate_plots(
-            pc_df,
-            kind_map=kind_map,
-            class_to_idx=class_to_idx,
-            out_dir=sub_dir,
-            eval_class_groups=config.eval_class_groups,
-        )
-        print(f"Saved {sub_name} metrics + plots to {sub_dir}")
 
     _class_metadata_frame(class_names, kind_map).write_csv(
         experiment_dir / "class_metadata.csv"

@@ -62,6 +62,12 @@ class TrainNaiveSystemConfig:
     safe_ascent_weight: float = 5e-5
     dangerous_ascent_weight: float = 5e-5
 
+    # During the first `gate_warmup_steps` steps the system CE loss is computed
+    # as if the gate emitted 1 for every unknown-label item (i.e. the dangerous
+    # model handles everything except known-safe items). The gate BCE loss and
+    # ascent losses are unaffected.
+    gate_warmup_steps: int = 200
+
     # Which submodules receive gradient updates.
     is_safe_model_trainable: bool = True
     is_dangerous_model_trainable: bool = False
@@ -641,7 +647,23 @@ def main(config: TrainNaiveSystemConfig) -> None:
         dangerous_logits_BC = out["dangerous_logits"]
         computed_gate_B = out["computed_gate"]
 
-        log_pred_BC = torch.log(prediction_BC.clamp(min=1e-8))
+        in_warmup = global_step < config.gate_warmup_steps
+        if in_warmup:
+            # Ignore the computed gate: force gate=1 for everything that isn't
+            # known-safe, so the dangerous model drives the system prediction
+            # on unknowns and known-dangerous items. Reuse probs from the main
+            # forward pass to avoid a second forward.
+            warmup_gate_B1 = (~is_known_safe_B).to(
+                dtype=prediction_BC.dtype, device=prediction_BC.device
+            ).unsqueeze(1)
+            system_pred_for_ce_BC = (
+                (1 - warmup_gate_B1) * out["safe_probs"]
+                + warmup_gate_B1 * out["dangerous_probs"]
+            )
+        else:
+            system_pred_for_ce_BC = prediction_BC
+
+        log_pred_BC = torch.log(system_pred_for_ce_BC.clamp(min=1e-8))
         L_system = nn.functional.nll_loss(log_pred_BC, labels)
 
         zero = torch.tensor(0.0, device=device)

@@ -9,11 +9,12 @@ from src.cifar.train_safety_classifier import build_binary_cifar_resnet18
 
 
 class NaiveSystemOutput(TypedDict):
-    prediction: torch.Tensor
+    system_output: torch.Tensor
+    system_output_detached: torch.Tensor
+    safe_model_output: torch.Tensor
+    dangerous_model_output: torch.Tensor
     safe_logits: torch.Tensor
     dangerous_logits: torch.Tensor
-    safe_probs: torch.Tensor
-    dangerous_probs: torch.Tensor
     computed_gate: torch.Tensor
     used_gate: torch.Tensor
 
@@ -70,46 +71,35 @@ class NaiveSystem(nn.Module):
             num_classes=num_classes,
         )
 
-    def forward(
-        self,
-        images_BCHW: torch.Tensor,
-        *,
-        force_gate_to_zero_B: Optional[torch.Tensor] = None,
-        force_gate_to_one_B: Optional[torch.Tensor] = None,
-    ) -> NaiveSystemOutput:
+    def forward(self, images_BCHW: torch.Tensor) -> NaiveSystemOutput:
         safe_logits_BC = self.model_safe(images_BCHW)
         dangerous_logits_BC = self.model_dangerous(images_BCHW)
+        safe_probs_BC = torch.softmax(safe_logits_BC, dim=-1)
+        dangerous_probs_BC = torch.softmax(dangerous_logits_BC, dim=-1)
 
         gate_logits_B2 = self.gate(images_BCHW)
         computed_gate_B = torch.softmax(gate_logits_B2, dim=-1)[:, 1]
-
         used_gate_B = computed_gate_B
-        if force_gate_to_zero_B is not None:
-            used_gate_B = torch.where(
-                force_gate_to_zero_B.to(device=used_gate_B.device, dtype=torch.bool),
-                torch.zeros_like(used_gate_B),
-                used_gate_B,
-            )
-        if force_gate_to_one_B is not None:
-            used_gate_B = torch.where(
-                force_gate_to_one_B.to(device=used_gate_B.device, dtype=torch.bool),
-                torch.ones_like(used_gate_B),
-                used_gate_B,
-            )
-
-        probs_safe_BC = torch.softmax(safe_logits_BC, dim=-1)
-        probs_dangerous_BC = torch.softmax(dangerous_logits_BC, dim=-1)
         used_gate_B1 = used_gate_B.unsqueeze(1)
-        prediction_BC = (
-            (1 - used_gate_B1) * probs_safe_BC + used_gate_B1 * probs_dangerous_BC
+
+        system_output_BC = (
+            (1 - used_gate_B1) * safe_probs_BC + used_gate_B1 * dangerous_probs_BC
+        )
+        # Same mixture, but with the two models' contributions detached so that
+        # any loss computed from this output only propagates gradients into the
+        # gate.
+        system_output_detached_BC = (
+            (1 - used_gate_B1) * safe_probs_BC.detach()
+            + used_gate_B1 * dangerous_probs_BC.detach()
         )
 
         return {
-            "prediction": prediction_BC,
+            "system_output": system_output_BC,
+            "system_output_detached": system_output_detached_BC,
+            "safe_model_output": safe_probs_BC,
+            "dangerous_model_output": dangerous_probs_BC,
             "safe_logits": safe_logits_BC,
             "dangerous_logits": dangerous_logits_BC,
-            "safe_probs": probs_safe_BC,
-            "dangerous_probs": probs_dangerous_BC,
             "computed_gate": computed_gate_B,
             "used_gate": used_gate_B,
         }

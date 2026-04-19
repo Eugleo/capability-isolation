@@ -66,7 +66,7 @@ class TrainNaiveSystemConfig:
     # as if the gate emitted 1 for every unknown-label item (i.e. the dangerous
     # model handles everything except known-safe items). The gate BCE loss and
     # ascent losses are unaffected.
-    gate_warmup_steps: int = 200
+    gate_warmup_steps: int = 1000
 
     # Which submodules receive gradient updates.
     is_safe_model_trainable: bool = True
@@ -74,9 +74,7 @@ class TrainNaiveSystemConfig:
     is_gate_trainable: bool = True
 
     # Init paths; None means freshly initialized weights.
-    safe_model_path: str | None = (
-        "experiments/2026-04-19_13-33-28_people_20p_ignore_unknown/unlearned_model.pt"
-    )
+    safe_model_path: str | None = "checkpoints/cifar100/train_resnet.pt"
     dangerous_model_path: str | None = "checkpoints/cifar100/train_resnet.pt"
     gate_path: str | None = None
 
@@ -306,7 +304,7 @@ def _eval_per_class_system(
         labels = batch["label"].to(device)
 
         out = system(images)
-        probs = out["prediction"]
+        probs = out["system_output"]
         log_probs = torch.log(probs.clamp(min=1e-8))
         per_loss = nn.functional.nll_loss(log_probs, labels, reduction="none")
 
@@ -637,31 +635,31 @@ def main(config: TrainNaiveSystemConfig) -> None:
         is_known_dang_B = is_known_B & is_dangerous_B
 
         optimizer.zero_grad()
-        out = system(
-            images,
-            force_gate_to_zero_B=is_known_safe_B,
-            force_gate_to_one_B=is_known_dang_B,
-        )
-        prediction_BC = out["prediction"]
+        out = system(images)
         safe_logits_BC = out["safe_logits"]
         dangerous_logits_BC = out["dangerous_logits"]
+        safe_probs_BC = out["safe_model_output"]
+        dangerous_probs_BC = out["dangerous_model_output"]
+        system_probs_BC = out["system_output"]
+        system_probs_detached_BC = out["system_output_detached"]
         computed_gate_B = out["computed_gate"]
 
+        # Pick the per-example prediction used for the system CE loss:
+        #   - known-safe     -> safe model output    (grads through safe only)
+        #   - known-dangerous-> dangerous model output (grads through dangerous only)
+        #   - unknown, warmup-> system output detached (grads through gate only)
+        #   - unknown, post  -> system output         (grads through both + gate)
         in_warmup = global_step < config.gate_warmup_steps
-        if in_warmup:
-            # Ignore the computed gate: force gate=1 for everything that isn't
-            # known-safe, so the dangerous model drives the system prediction
-            # on unknowns and known-dangerous items. Reuse probs from the main
-            # forward pass to avoid a second forward.
-            warmup_gate_B1 = (~is_known_safe_B).to(
-                dtype=prediction_BC.dtype, device=prediction_BC.device
-            ).unsqueeze(1)
-            system_pred_for_ce_BC = (
-                (1 - warmup_gate_B1) * out["safe_probs"]
-                + warmup_gate_B1 * out["dangerous_probs"]
-            )
-        else:
-            system_pred_for_ce_BC = prediction_BC
+        unknown_pred_BC = (
+            system_probs_detached_BC if in_warmup else system_probs_BC
+        )
+        is_known_safe_B1 = is_known_safe_B.unsqueeze(1)
+        is_known_dang_B1 = is_known_dang_B.unsqueeze(1)
+        system_pred_for_ce_BC = torch.where(
+            is_known_safe_B1,
+            safe_probs_BC,
+            torch.where(is_known_dang_B1, dangerous_probs_BC, unknown_pred_BC),
+        )
 
         log_pred_BC = torch.log(system_pred_for_ce_BC.clamp(min=1e-8))
         L_system = nn.functional.nll_loss(log_pred_BC, labels)

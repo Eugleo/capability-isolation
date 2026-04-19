@@ -7,34 +7,35 @@ import matplotlib.pyplot as plt
 import polars as pl
 
 # %%
-# safe dang
+
 # experiment_dirs: list[str] = [
-#     "experiments/2026-04-14_21-26-34_safe_dang_1p",
-#     "experiments/2026-04-14_21-30-00_safe_dang_5p",
-#     "experiments/2026-04-14_21-33-25_safe_dang_10p",
-#     "experiments/2026-04-14_21-36-50_safe_dang_25p",
-#     "experiments/2026-04-14_21-40-14_safe_dang_50p",
+#     "experiments/2026-04-18_07-51-18_people_20p_classify_unknown",
+#     "experiments/2026-04-18_08-40-41_people_20p_ignore_unknown",
+#     "experiments/2026-04-18_09-29-35_people_20p_forget_unknown",
+#     "experiments/2026-04-18_10-18-35_people_20p_retain_unknown",
 # ]
 
-# safe+unk dang
 # experiment_dirs: list[str] = [
-#     "experiments/2026-04-14_21-43-39_safe+unk_dang_1p",
-#     "experiments/2026-04-14_21-47-03_safe+unk_dang_5p",
-#     "experiments/2026-04-14_21-50-26_safe+unk_dang_10p",
-#     "experiments/2026-04-14_21-53-49_safe+unk_dang_25p",
-#     "experiments/2026-04-14_21-57-14_safe+unk_dang_50p",
+#     "experiments/2026-04-18_08-03-39_people_40p_classify_unknown",
+#     "experiments/2026-04-18_08-52-52_people_40p_ignore_unknown",
+#     "experiments/2026-04-18_09-41-54_people_40p_forget_unknown",
+#     "experiments/2026-04-18_10-30-48_people_40p_retain_unknown",
 # ]
 
-# safe dang+unk
+# experiment_dirs: list[str] = [
+#     "experiments/2026-04-18_08-15-58_people_60p_classify_unknown",
+#     "experiments/2026-04-18_09-05-07_people_60p_ignore_unknown",
+#     "experiments/2026-04-18_09-54-10_people_60p_forget_unknown",
+#     "experiments/2026-04-18_10-43-03_people_60p_retain_unknown",
+# ]
+
 experiment_dirs: list[str] = [
-    "experiments/2026-04-14_22-00-40_safe_dang+unk_1p",
-    "experiments/2026-04-14_22-04-04_safe_dang+unk_5p",
-    "experiments/2026-04-14_22-07-29_safe_dang+unk_10p",
-    "experiments/2026-04-14_22-10-54_safe_dang+unk_25p",
-    "experiments/2026-04-14_22-14-19_safe_dang+unk_50p",
+   "experiments/2026-04-18_08-28-19_people_80p_classify_unknown",
+   "experiments/2026-04-18_09-17-20_people_80p_ignore_unknown",
+   "experiments/2026-04-18_10-06-22_people_80p_forget_unknown",
+   "experiments/2026-04-18_10-55-16_people_80p_retain_unknown",
 ]
 
-# %%
 def _load_cifar_unlearn_metrics(exp_path: Path) -> pl.DataFrame:
     """Return long metrics with columns step, class_name, metric, value."""
     metrics_path = exp_path / "metrics.csv"

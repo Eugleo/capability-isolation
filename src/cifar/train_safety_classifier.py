@@ -4,6 +4,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Literal
 
+import matplotlib.colors as mcolors
 import matplotlib.pyplot as plt
 import numpy as np
 import polars as pl
@@ -53,6 +54,7 @@ PROBE_SPECS: tuple[tuple[str, int], ...] = (
     ("layer4.1", 512),
 )
 PROBE_NAMES: tuple[str, ...] = tuple(name for name, _ in PROBE_SPECS)
+PROBE_CHANNELS: dict[str, int] = {name: c for name, c in PROBE_SPECS}
 
 
 @dataclass
@@ -149,6 +151,81 @@ class MultiProbeResNet18(nn.Module):
             feat_BC = self.pool(feat_BCHW).flatten(start_dim=1)
             logits_per_probe[name] = self.probes[self._probe_key(name)](feat_BC)
         return logits_per_probe
+
+
+class SingleProbeBinaryClassifier(nn.Module):
+    def __init__(
+        self,
+        backbone: nn.Module,
+        *,
+        tap_layer: str,
+        in_channels: int,
+        num_classes: int = 2,
+    ) -> None:
+        super().__init__()
+        if tap_layer not in PROBE_NAMES:
+            raise ValueError(
+                f"tap_layer must be one of {PROBE_NAMES}, got {tap_layer!r}"
+            )
+        self.backbone = backbone
+        self.tap_layer = tap_layer
+        self.head = nn.Linear(in_channels, num_classes)
+        self.pool = nn.AdaptiveAvgPool2d(1)
+
+    def forward(self, images_B3HW: torch.Tensor) -> torch.Tensor:
+        x = self.backbone.conv1(images_B3HW)
+        x = self.backbone.bn1(x)
+        x = self.backbone.relu(x)
+        if self.tap_layer == "stem":
+            return self.head(self.pool(x).flatten(start_dim=1))
+        x = self.backbone.maxpool(x)
+        for stage_name in ("layer1", "layer2", "layer3", "layer4"):
+            stage = getattr(self.backbone, stage_name)
+            for i, block in enumerate(stage):
+                x = block(x)
+                if self.tap_layer == f"{stage_name}.{i}":
+                    return self.head(self.pool(x).flatten(start_dim=1))
+        raise RuntimeError(f"tap_layer {self.tap_layer!r} not reached during forward")
+
+
+def save_single_probe_classifier(
+    path: str | Path,
+    *,
+    backbone: nn.Module,
+    head: nn.Linear,
+    tap_layer: str,
+    pretrained_num_classes: int,
+    extra: dict | None = None,
+) -> None:
+    payload: dict = {
+        "tap_layer": tap_layer,
+        "in_channels": head.in_features,
+        "num_classes": head.out_features,
+        "pretrained_num_classes": pretrained_num_classes,
+        "backbone_state_dict": {k: v.detach().cpu() for k, v in backbone.state_dict().items()},
+        "head_state_dict": {k: v.detach().cpu() for k, v in head.state_dict().items()},
+    }
+    if extra is not None:
+        payload["extra"] = extra
+    torch.save(payload, path)
+
+
+def load_single_probe_classifier(
+    path: str | Path,
+    *,
+    map_location: torch.device | str = "cpu",
+) -> SingleProbeBinaryClassifier:
+    ckpt = torch.load(path, map_location=map_location, weights_only=False)
+    backbone = build_cifar_resnet18(num_classes=ckpt["pretrained_num_classes"])
+    backbone.load_state_dict(ckpt["backbone_state_dict"])
+    model = SingleProbeBinaryClassifier(
+        backbone=backbone,
+        tap_layer=ckpt["tap_layer"],
+        in_channels=ckpt["in_channels"],
+        num_classes=ckpt["num_classes"],
+    )
+    model.head.load_state_dict(ckpt["head_state_dict"])
+    return model
 
 
 def build_safety_classifier_configs_for_dangerous_grid(
@@ -326,7 +403,7 @@ def _run_eval(
     kind_map: dict[int, SafetyKind],
     dangerous_idxs: set[int],
     per_class_rows: list[dict],
-) -> None:
+) -> dict[str, float]:
     stats_per_probe = _eval_per_class_binary_multi(
         model, eval_loader, device, num_classes
     )
@@ -340,6 +417,7 @@ def _run_eval(
     )
 
     safe_idxs = set(range(num_classes)) - dangerous_idxs
+    dang_acc_per_probe: dict[str, float] = {}
     print(f"  [eval step={step}] per-probe top1:")
     for probe_name in model.probe_names:
         s = stats_per_probe[probe_name]
@@ -348,12 +426,15 @@ def _run_eval(
         safe_c = sum(int(s["count"][i]) for i in safe_idxs)
         safe_t1 = sum(int(s["top1"][i]) for i in safe_idxs)
         total = safe_c + dang_c
+        dang_acc = dang_t1 / max(dang_c, 1)
+        dang_acc_per_probe[probe_name] = dang_acc
         print(
             f"    {probe_name:<10s} "
             f"overall={((safe_t1 + dang_t1) / max(total, 1)):.2%}, "
             f"safe={safe_t1 / max(safe_c, 1):.2%}, "
-            f"dang={dang_t1 / max(dang_c, 1):.2%}"
+            f"dang={dang_acc:.2%}"
         )
+    return dang_acc_per_probe
 
 
 def _per_probe_wide_to_long(wide: pl.DataFrame) -> pl.DataFrame:
@@ -466,6 +547,101 @@ def _plot_probe_accuracy_by_safety(
     axes[-1].legend(loc="lower right", fontsize=8, title="Probe layer")
     fig.suptitle("Linear-probe accuracy: safe vs dangerous classes")
     fig.tight_layout()
+    fig.savefig(save_path, dpi=150)
+    plt.close(fig)
+
+
+def _plot_probe_pareto(
+    pc_df: pl.DataFrame,
+    *,
+    probe_order: tuple[str, ...],
+    save_path: Path,
+    ncols: int = 3,
+) -> None:
+    pc_with_safety = pc_df.with_columns(
+        pl.when(pl.col("kind").is_in(["k-dang", "u-dang"]))
+        .then(pl.lit("dangerous"))
+        .otherwise(pl.lit("safe"))
+        .alias("safety")
+    )
+    acc = _accuracy_per_probe_step(pc_with_safety, extra_group_col="safety")
+
+    n = len(probe_order)
+    nrows = (n + ncols - 1) // ncols
+    fig, axes = plt.subplots(
+        nrows,
+        ncols,
+        figsize=(4.5 * ncols, 4.5 * nrows),
+        sharex=True,
+        sharey=True,
+        constrained_layout=True,
+    )
+    axes_flat = np.atleast_1d(axes).flatten()
+
+    all_steps = sorted(acc["step"].unique().to_list())
+    if not all_steps:
+        plt.close(fig)
+        return
+    norm = mcolors.Normalize(vmin=min(all_steps), vmax=max(all_steps))
+    cmap = plt.cm.viridis
+
+    last_scatter = None
+    for ax, probe_name in zip(axes_flat, probe_order):
+        sub = acc.filter(pl.col("probe") == probe_name)
+        steps_with_data: list[int] = []
+        safe_accs: list[float] = []
+        dang_accs: list[float] = []
+        for step in all_steps:
+            step_df = sub.filter(pl.col("step") == step)
+            safe_row = step_df.filter(pl.col("safety") == "safe")
+            dang_row = step_df.filter(pl.col("safety") == "dangerous")
+            if safe_row.is_empty() or dang_row.is_empty():
+                continue
+            safe_accs.append(float(safe_row["top1_acc"].item()) * 100)
+            dang_accs.append(float(dang_row["top1_acc"].item()) * 100)
+            steps_with_data.append(int(step))
+        ax.set_title(probe_name)
+        ax.set_xlim(0, 100)
+        ax.set_ylim(0, 100)
+        ax.grid(True, alpha=0.25)
+        if not steps_with_data:
+            continue
+        for i in range(len(steps_with_data) - 1):
+            ax.plot(
+                safe_accs[i : i + 2],
+                dang_accs[i : i + 2],
+                color=cmap(norm(steps_with_data[i])),
+                linewidth=1.5,
+                zorder=1,
+            )
+        last_scatter = ax.scatter(
+            safe_accs,
+            dang_accs,
+            c=steps_with_data,
+            cmap=cmap,
+            norm=norm,
+            s=35,
+            edgecolors="white",
+            linewidths=0.5,
+            zorder=2,
+        )
+
+    for ax in axes_flat[len(probe_order):]:
+        ax.set_visible(False)
+
+    fig.supxlabel("Safe top-1 accuracy (%) \u2191")
+    fig.supylabel("Dangerous top-1 accuracy (%) \u2191")
+    fig.suptitle("Per-probe Pareto: Safe vs Dangerous accuracy")
+
+    if last_scatter is not None:
+        cbar = fig.colorbar(
+            last_scatter,
+            ax=axes_flat.tolist(),
+            shrink=0.85,
+            pad=0.02,
+        )
+        cbar.set_label("Step")
+
     fig.savefig(save_path, dpi=150)
     plt.close(fig)
 
@@ -648,8 +824,23 @@ def main(config: TrainSafetyClassifierConfig) -> None:
         per_class_rows=per_class_rows,
     )
 
+    best_dang_acc_per_probe: dict[str, float] = {n: -1.0 for n in PROBE_NAMES}
+    best_dang_step_per_probe: dict[str, int] = {n: -1 for n in PROBE_NAMES}
+    best_head_state_per_probe: dict[str, dict[str, torch.Tensor]] = {}
+
+    def _maybe_update_best(dang_accs: dict[str, float], step: int) -> None:
+        for probe_name, dang_acc in dang_accs.items():
+            if dang_acc > best_dang_acc_per_probe[probe_name]:
+                best_dang_acc_per_probe[probe_name] = dang_acc
+                best_dang_step_per_probe[probe_name] = step
+                head_module = model.probes[model._probe_key(probe_name)]
+                best_head_state_per_probe[probe_name] = {
+                    k: v.detach().cpu().clone() for k, v in head_module.state_dict().items()
+                }
+
     global_step = 0
-    _run_eval(model, step=global_step, **eval_kwargs)
+    dang_accs = _run_eval(model, step=global_step, **eval_kwargs)
+    _maybe_update_best(dang_accs, global_step)
 
     for epoch in range(config.epochs):
         loss_per_probe, acc_per_probe, global_step = train_one_epoch(
@@ -671,7 +862,8 @@ def main(config: TrainSafetyClassifierConfig) -> None:
             f"lr={optimizer.param_groups[0]['lr']:.2e}"
         )
         scheduler.step()
-        _run_eval(model, step=global_step, **eval_kwargs)
+        dang_accs = _run_eval(model, step=global_step, **eval_kwargs)
+        _maybe_update_best(dang_accs, global_step)
 
     pc_df = pl.DataFrame(per_class_rows)
     metrics_long = _per_probe_wide_to_long(pc_df)
@@ -702,6 +894,11 @@ def main(config: TrainSafetyClassifierConfig) -> None:
         probe_order=PROBE_NAMES,
         save_path=experiment_dir / "probe_accuracy_by_kind.png",
     )
+    _plot_probe_pareto(
+        pc_df,
+        probe_order=PROBE_NAMES,
+        save_path=experiment_dir / "probe_pareto.png",
+    )
     ranking = _probe_ranking_frame(overall_df, probe_order=PROBE_NAMES)
     ranking.write_csv(experiment_dir / "probe_ranking.csv")
 
@@ -709,16 +906,66 @@ def main(config: TrainSafetyClassifierConfig) -> None:
     for row in ranking.iter_rows(named=True):
         print(f"  #{row['rank']} {row['probe']:<10s} acc={row['overall_top1_acc']:.2%}")
 
-    model_path = experiment_dir / "safety_classifier.pt"
-    torch.save({"model_state_dict": model.state_dict()}, model_path)
+    # Save each probe as a self-contained binary classifier. The backbone is
+    # the same frozen tensor across all probes; each checkpoint is a complete
+    # SingleProbeBinaryClassifier (loadable via load_single_probe_classifier),
+    # so the caller never needs to know this came from a multi-probe run.
+    probes_dir = experiment_dir / "probes"
+    probes_dir.mkdir(parents=True, exist_ok=True)
+    print("\nSaving per-probe checkpoints (final + best-on-all-dangerous):")
+    for probe_name in PROBE_NAMES:
+        probe_dir = probes_dir / probe_name.replace(".", "_")
+        probe_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"Saved metrics to {metrics_csv_path}")
+        head_module = model.probes[model._probe_key(probe_name)]
+        # final
+        final_path = probe_dir / "final.pt"
+        save_single_probe_classifier(
+            final_path,
+            backbone=model.backbone,
+            head=head_module,
+            tap_layer=probe_name,
+            pretrained_num_classes=config.pretrained_num_classes,
+            extra={"step": int(global_step), "selection": "final"},
+        )
+
+        # best on all-dangerous accuracy (known + unknown). Restore that head's
+        # snapshot into a fresh Linear so we can reuse the save helper unchanged.
+        best_path = probe_dir / "best_dang.pt"
+        best_head = nn.Linear(PROBE_CHANNELS[probe_name], 2)
+        if probe_name in best_head_state_per_probe:
+            best_head.load_state_dict(best_head_state_per_probe[probe_name])
+        else:
+            # Should not happen (we always evaluate at least once), but fall
+            # back to the final head if no best snapshot was recorded.
+            best_head.load_state_dict({
+                k: v.detach().cpu().clone() for k, v in head_module.state_dict().items()
+            })
+        save_single_probe_classifier(
+            best_path,
+            backbone=model.backbone,
+            head=best_head,
+            tap_layer=probe_name,
+            pretrained_num_classes=config.pretrained_num_classes,
+            extra={
+                "step": int(best_dang_step_per_probe[probe_name]),
+                "selection": "best_dang_acc",
+                "best_dang_acc": float(best_dang_acc_per_probe[probe_name]),
+            },
+        )
+        print(
+            f"  {probe_name:<10s} final.pt + best_dang.pt "
+            f"(best dang acc = {best_dang_acc_per_probe[probe_name]:.2%} "
+            f"@ step {best_dang_step_per_probe[probe_name]})"
+        )
+    print(f"\nSaved metrics to {metrics_csv_path}")
     print(f"Saved class metadata to {experiment_dir / 'class_metadata.csv'}")
     print(f"Saved probe ranking to {experiment_dir / 'probe_ranking.csv'}")
     print(f"Saved overall-accuracy plot to {experiment_dir / 'probe_accuracy_over_steps.png'}")
     print(f"Saved safe-vs-dangerous plot to {experiment_dir / 'probe_accuracy_by_safety.png'}")
     print(f"Saved by-kind plot to {experiment_dir / 'probe_accuracy_by_kind.png'}")
-    print(f"Saved model to {model_path}")
+    print(f"Saved per-probe pareto plot to {experiment_dir / 'probe_pareto.png'}")
+    print(f"Saved per-probe models to {probes_dir}")
 
 
 if __name__ == "__main__":

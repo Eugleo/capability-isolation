@@ -66,7 +66,7 @@ class TrainNaiveSystemConfig:
     # as if the gate emitted 1 for every unknown-label item (i.e. the dangerous
     # model handles everything except known-safe items). The gate BCE loss and
     # ascent losses are unaffected.
-    gate_warmup_steps: int = 1000
+    gate_warmup_steps: int = 5000
 
     # Which submodules receive gradient updates.
     is_safe_model_trainable: bool = True
@@ -861,7 +861,7 @@ if __name__ == "__main__":
             base_20p,
             name=f"{base_20p.name}_gate_loss_w={str(w).replace('.', 'p')}",
             gate_bce_weight=w,
-            max_steps=4000,
+            max_steps=10000,
         )
         for w in gate_bce_weights
     ]
